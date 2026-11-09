@@ -622,7 +622,9 @@ impl State {
                 _ => DIM,
             };
             let pad0 = " ".repeat(w - top.chars().count());
-            l0.push_str(&format!("{pre}{color}{head}{RESET}{pre}{BOLD}{loc}{RESET}{pre}{ctx_col}{ctx}{RESET}{pre}{pad0}{post}"));
+            // SGR 5 = blink: the terminal animates it, no redraw timer needed
+            let blink = if r.agent.status == "needs_input" { "\x1b[5m" } else { "" };
+            l0.push_str(&format!("{pre}{color}{blink}{head}{RESET}{pre}{BOLD}{loc}{RESET}{pre}{ctx_col}{ctx}{RESET}{pre}{pad0}{post}"));
             l1.push_str(&format!("{pre}{}{post}", trunc(&purpose, w)));
             self.hits.push((0, x, x + w, i));
             self.hits.push((1, x, x + w, i));
@@ -672,9 +674,10 @@ impl State {
             };
             let sel = i == self.selected;
             let (pre, post) = if sel { (REV, RESET) } else { ("", "") };
+            let blink = if a.status == "needs_input" { "\x1b[5m" } else { "" };
             let marker = if r.focused { format!("▶{:<2}", i + 1) } else { format!(" {:<2}", i + 1) };
             let _ = writeln!(o, 
-                "{pre}{marker} {color}{icon} {}{RESET}{pre}{}{}{}{ctx_col}{}{RESET}{pre}{}{}{}{post}",
+                "{pre}{marker} {color}{blink}{icon} {}{RESET}{pre}{}{}{}{ctx_col}{}{RESET}{pre}{}{}{}{post}",
                 trunc(label, 9),
                 trunc(&tab, 9) + " ",
                 trunc(&loc, 33) + " ",

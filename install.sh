@@ -3,7 +3,7 @@
 #   1. ~/.config/zellij/layouts/agents.kdl       = zellij's default layout + agents bar under the tab bar
 #   2. ~/.config/zellij/layouts/agents.swap.kdl  = zellij's default swap layouts + agents bar (Alt [ / Alt ] keep it)
 #   3. default_layout "agents" in config.kdl (backup: config.kdl.zam.bak)
-#   4. Ctrl+Alt+1..9 (jump to agent n) and Ctrl+Alt+left/right (previous/next agent, wrapping) in config.kdl
+#   4. Ctrl+Alt+1..9 (jump to agent n), Ctrl+Alt+0 (next agent waiting on you) and Ctrl+Alt+left/right (previous/next agent, wrapping) in config.kdl
 #      (lines tagged "// zellij-agents"; re-running replaces them)
 # The layout points at this checkout's dist/ and scripts/, so ./build.sh updates new sessions directly.
 # Usage: ./install.sh [--layouts-only | --uninstall]
@@ -73,7 +73,7 @@ t = " // zellij-agents"
 bind = lambda key, payload: f"        bind \"{key}\" {{ MessagePlugin {{ name \"zam_jump\"; payload \"{payload}\"; }}; }}" + t
 lines = ["    shared_among \"normal\" \"locked\" {" + t]
 lines += [bind(f"Ctrl Alt {n}", n) for n in range(1, 10)]
-lines += [bind("Ctrl Alt left", "left"), bind("Ctrl Alt right", "right")]
+lines += [bind("Ctrl Alt 0", "next"), bind("Ctrl Alt left", "left"), bind("Ctrl Alt right", "right")]
 lines.append("    }" + t)
 print("\n".join(lines))
 ')
