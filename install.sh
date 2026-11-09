@@ -24,6 +24,8 @@ fi
 
 [[ -f "$here/dist/zellij-agents.wasm" ]] || "$here/build.sh"
 mkdir -p "$layouts"
+# fresh zellij installs run on built-in defaults without a config file; our keybinds block merges with those
+[[ -e "$cfg_real" ]] || { mkdir -p "$(dirname "$cfg_real")"; : > "$cfg_real"; }
 
 bar=$(cat <<EOF
     pane size=2 borderless=true {
@@ -61,7 +63,7 @@ if ! grep -q '^default_layout ' "$cfg_real"; then
 elif ! grep -q '^default_layout "agents"' "$cfg_real"; then
   echo "config.kdl already sets a different default_layout; change it to \"agents\" yourself:" >&2
   grep -n '^default_layout ' "$cfg_real" >&2
-  exit 1
+  layout_skipped=1
 fi
 # jump keys: drop previously installed ones (tagged lines, keeps default_layout), then insert the current set
 [[ -f "$cfg_real.zam.bak" ]] || cp "$cfg_real" "$cfg_real.zam.bak"
@@ -86,4 +88,9 @@ else:
     src = src[:m.end()] + keys + "\n" + src[m.end():]
 open(p, "w").write(src)
 ' "$cfg_real" "$keys"
-echo "installed: new zellij sessions get the agents bar ($layouts/agents.kdl)"
+if [[ -n "${layout_skipped:-}" ]]; then
+  echo "installed: jump keys + layouts; set default_layout \"agents\" to get the bar in new sessions"
+else
+  echo "installed: new zellij sessions get the agents bar ($layouts/agents.kdl)"
+fi
+echo "first run: the bar asks for permissions; click it and press y. Remembered from then on (bars already open in other tabs ask once too)"
