@@ -31,8 +31,9 @@ Needs rustup + `wasm32-wasip1`. Without a system C compiler it uses zig from `~/
 ## Install (bar in every new session)
 
 ```sh
-./install.sh               # layouts/agents.kdl + agents.swap.kdl in ~/.config/zellij/layouts, default_layout "agents" in config.kdl
-./install.sh --uninstall   # undo
+./install.sh                # layouts/agents.kdl + agents.swap.kdl in ~/.config/zellij/layouts, default_layout "agents" in config.kdl
+./install.sh --layouts-only # only the layouts; config.kdl untouched
+./install.sh --uninstall    # undo
 ```
 
 The layout is generated from zellij's own default layout and swap layouts, with the bar added under the tab bar. It points at this checkout, so `./build.sh` updates new sessions directly. Existing sessions keep their layout; start a new session (or `zellij action new-tab --layout agents`) to get the bar.
@@ -59,7 +60,8 @@ Only the bar in the tab you are looking at acts on it, so one press is one jump.
 Zellij reloads `config.kdl` in running sessions by itself. To load a new plugin build into bars that are already running:
 
 ```sh
-zellij action start-or-reload-plugin -c "mode=bar,scanner=$HOME/dev/zellij-agents-manager/scripts/zam-scan.py" file:$HOME/dev/zellij-agents-manager/dist/zellij-agents.wasm
+# run from the checkout; must match the bar config install.sh wrote into the layout
+zellij action start-or-reload-plugin -c "mode=bar,scanner=$PWD/scripts/zam-scan.py" "file:$PWD/dist/zellij-agents.wasm"
 ```
 
 The configuration must match the layout's exactly, or Zellij starts a new instance instead.
@@ -69,13 +71,15 @@ The configuration must match the layout's exactly, or Zellij starts a new instan
 Bar in every tab (new session with this layout):
 
 ```sh
-zellij --layout ~/dev/zellij-agents-manager/layouts/agents.kdl
+./install.sh --layouts-only   # writes ~/.config/zellij/layouts/agents.kdl pointing at this checkout
+zellij --layout agents
 ```
 
 Panel as a floating window in the current session:
 
 ```sh
-zellij plugin --floating --configuration "mode=panel,scanner=$HOME/dev/zellij-agents-manager/scripts/zam-scan.py" -- file:$HOME/dev/zellij-agents-manager/dist/zellij-agents.wasm
+# run from the checkout
+zellij plugin --floating --configuration "mode=panel,scanner=$PWD/scripts/zam-scan.py" -- "file:$PWD/dist/zellij-agents.wasm"
 ```
 
 Zellij asks for permissions on first load (read state, change state, run commands); press `y`.
@@ -84,11 +88,11 @@ Keybinding for the panel (add to the `shared_except "locked"` block of `config.k
 
 ```kdl
 bind "Alt a" {
-    LaunchOrFocusPlugin "file:~/dev/zellij-agents-manager/dist/zellij-agents.wasm" {
+    LaunchOrFocusPlugin "file:~/dev/zellij-agents-manager/dist/zellij-agents.wasm" {   // your checkout path; ~ works
         floating true
         move_to_focused_tab true
         mode "panel"
-        scanner "/home/ondra/dev/zellij-agents-manager/scripts/zam-scan.py"
+        scanner "~/dev/zellij-agents-manager/scripts/zam-scan.py"
     }
 }
 ```
@@ -98,7 +102,7 @@ bind "Alt a" {
 | key | default | |
 |---|---|---|
 | `mode` | `bar` | `bar` or `panel` |
-| `scanner` | `zam-scan.py` | absolute path recommended |
+| `scanner` | `zam-scan.py` | absolute path, or `~/…` |
 | `interval` | `2` | seconds between scans |
 | `hide_on_jump` | `true` | panel hides itself after jumping |
 | `debug_dump` | – | write each rendered frame to this path |

@@ -6,7 +6,8 @@
 #   4. Ctrl+Alt+1..9 (jump to agent n) and Ctrl+Alt+left/right (previous/next agent, wrapping) in config.kdl
 #      (lines tagged "// zellij-agents"; re-running replaces them)
 # The layout points at this checkout's dist/ and scripts/, so ./build.sh updates new sessions directly.
-# Usage: ./install.sh [--uninstall]
+# Usage: ./install.sh [--layouts-only | --uninstall]
+#   --layouts-only  write the layouts but leave config.kdl alone (try it: zellij --layout agents)
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 cfg_dir="${ZELLIJ_CONFIG_DIR:-$HOME/.config/zellij}"
@@ -48,6 +49,11 @@ print(src[:m.end()] + bar + "\n" + src[m.end():], end="")
 
 zellij setup --dump-layout default | insert_bar > "$layouts/agents.kdl"
 zellij setup --dump-swap-layout default | insert_bar > "$layouts/agents.swap.kdl"
+
+if [[ "${1:-}" == "--layouts-only" ]]; then
+  echo "wrote $layouts/agents.kdl; try it with: zellij --layout agents"
+  exit 0
+fi
 
 if ! grep -q '^default_layout ' "$cfg_real"; then
   cp "$cfg_real" "$cfg_real.zam.bak"

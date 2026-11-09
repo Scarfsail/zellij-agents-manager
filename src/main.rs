@@ -369,7 +369,13 @@ impl State {
         ctx.insert("zam".to_string(), "scan".to_string());
         // trailing args are ignored by the scanner; they show up in `ps` and help debugging
         let who = format!("id={}", self.my_id);
-        run_command(&["python3", "-I", &self.scanner, "--from", &who], ctx);
+        // run_command has no shell, so expand a leading "~/" here (via sh, which knows $HOME)
+        if let Some(rest) = self.scanner.strip_prefix("~/") {
+            let script = r#"exec python3 -I "$HOME/$1" --from "$2""#;
+            run_command(&["sh", "-c", script, "sh", rest, &who], ctx);
+        } else {
+            run_command(&["python3", "-I", &self.scanner, "--from", &who], ctx);
+        }
     }
 
     fn rebuild(&mut self) {
