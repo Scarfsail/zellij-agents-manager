@@ -4,7 +4,7 @@ A Zellij plugin that shows every running coding agent (Claude Code today; Codex/
 
 One WASM binary, two modes:
 
-- **`bar`**: a 2-row strip under the native tab bar. Each chip shows the agent number, status, repo@branch and context % on the first row and the session title on the second. Click a chip, or press `Ctrl+Alt+<number>`, to jump; `Ctrl+Alt+←/→` goes to the previous/next agent. The chip of the focused agent is reversed; `↗` marks an agent in another Zellij session. The icon and number of an agent waiting on you blink (needs the hooks below and a terminal that renders blinking text, e.g. WezTerm, kitty, foot).
+- **`bar`**: a 2-row strip under the native tab bar. Each chip shows the agent number, status, repo@branch and context % on the first row and the session title on the second. Click a chip, or press `Ctrl+Alt+<number>`, to jump; `Ctrl+Alt+←/→` goes to the previous/next agent. The chip of the focused agent is reversed; `↗` marks an agent in another Zellij session. A working agent shows a spinning `◐`; the chip of an agent waiting on you shows `?` and pulses amber until you focus it; after that only the `?` pulses, until it asks something new (needs the hooks below).
 - **`panel`**: a full table (status, name, tab, time in status, ctx %, model, uptime, task title from the pane). `j/k` select, `enter`/click jump, `n` jump to the next agent waiting on you, `q`/`esc` hide. Best as a floating pane toggled by a key.
 
 ## How detection works

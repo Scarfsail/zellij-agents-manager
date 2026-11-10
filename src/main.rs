@@ -29,6 +29,8 @@ struct Agent {
     title: String,
     branch: Option<String>,
     model: Option<String>,
+    /// the current question was already looked at (scanner's shared "read" mark)
+    seen: bool,
 }
 
 // ---------- plugin state ----------
@@ -45,6 +47,8 @@ struct Row {
     pane_title: String,
     local: bool,
     focused: bool,
+    /// waiting on you, but you have already focused it since the question came in
+    seen: bool,
     /// (floating, y, x) on screen: numbers go top-to-bottom, left-to-right within a tab
     screen_pos: (bool, usize, usize),
 }
@@ -69,6 +73,13 @@ struct State {
     my_tab: Option<usize>,
     ticks: u64,
     last_scan_tick: u64,
+    /// spinner frame for working agents, derived from the clock so stray ticks can't speed it up
+    frame: usize,
+    started: std::time::Instant,
+    /// when our one timer is due; earlier Timer events belong to duplicate chains and are dropped
+    next_tick: Option<std::time::Instant>,
+    /// seconds of animation ticks since the last poll (polls still happen once per `interval`)
+    since_poll: f64,
     hidden: bool,
     /// terminal panes the attached clients are focused on (authoritative; PaneInfo.is_focused goes stale)
     client_focus: Vec<u32>,
@@ -76,6 +87,8 @@ struct State {
     live_sessions: Option<Vec<String>>,
     /// SGR for the focused chip, from zellij's theme (ribbon_selected = the active tab's colours)
     active_style: Option<String>,
+    /// questions marked read by this instance (session id, status_since), until the scanner reports it
+    seen_local: std::collections::HashSet<(String, i64)>,
     error: Option<String>,
 }
 
@@ -100,10 +113,15 @@ impl Default for State {
             my_tab: None,
             ticks: 1,
             last_scan_tick: 0,
+            frame: 0,
+            started: std::time::Instant::now(),
+            next_tick: None,
+            since_poll: 0.0,
             hidden: false,
             client_focus: Vec::new(),
             live_sessions: None,
             active_style: None,
+            seen_local: Default::default(),
             error: None,
         }
     }
@@ -154,7 +172,9 @@ impl ZellijPlugin for State {
                     set_selectable(false);
                 }
                 self.kick_scan();
-                set_timeout(self.interval);
+                if self.next_tick.is_none() {
+                    self.arm(self.interval); // Granted can arrive more than once: never start a second chain
+                }
                 true
             }
             Event::PermissionRequestResult(PermissionStatus::Denied) => {
@@ -190,10 +210,27 @@ impl ZellijPlugin for State {
                 true
             }
             Event::Timer(_) => {
-                // Visibility check first; the scan happens in ListClients if we are on screen.
-                self.ticks += 1;
-                list_clients();
-                set_timeout(self.interval);
+                let now = std::time::Instant::now();
+                if self.next_tick.is_some_and(|t| now + std::time::Duration::from_millis(50) < t) {
+                    return false; // a duplicate chain firing early: let it die
+                }
+                // One timer chain: fast while a visible agent is working (spinner), else once per interval.
+                let animate = self.animating();
+                let step = if animate { ANIM_STEP } else { self.interval };
+                self.arm(step);
+                self.since_poll += step;
+                if !animate || self.since_poll >= self.interval {
+                    // Visibility check first; the scan happens in ListClients if we are on screen.
+                    self.since_poll = 0.0;
+                    self.ticks += 1;
+                    list_clients();
+                }
+                if animate {
+                    let frame = (self.started.elapsed().as_secs_f64() / ANIM_STEP) as usize;
+                    let changed = frame != self.frame;
+                    self.frame = frame;
+                    return changed;
+                }
                 false
             }
             Event::ListClients(clients) => {
@@ -368,6 +405,16 @@ impl State {
             .map(|(t, _)| *t)
     }
 
+    fn arm(&mut self, step: f64) {
+        set_timeout(step);
+        self.next_tick = Some(std::time::Instant::now() + std::time::Duration::from_secs_f64(step));
+    }
+
+    /// Redraw the spinner only on screen, and only when something is spinning.
+    fn animating(&self) -> bool {
+        !self.hidden && self.rows.iter().any(|r| r.agent.status == "busy" || r.agent.status == "needs_input")
+    }
+
     /// list_clients() fires on every pane/tab event too; keep scans at most once per interval.
     fn due(&self) -> bool {
         self.last_scan_tick != self.ticks
@@ -379,16 +426,24 @@ impl State {
         }
         self.scanning = true;
         self.last_scan_tick = self.ticks;
-        let mut ctx = BTreeMap::new();
-        ctx.insert("zam".to_string(), "scan".to_string());
         // trailing args are ignored by the scanner; they show up in `ps` and help debugging
         let who = format!("id={}", self.my_id);
+        self.run_scanner(&["--from", &who], "scan");
+    }
+
+    fn run_scanner(&self, args: &[&str], tag: &str) {
+        let mut ctx = BTreeMap::new();
+        ctx.insert("zam".to_string(), tag.to_string());
         // run_command has no shell, so expand a leading "~/" here (via sh, which knows $HOME)
         if let Some(rest) = self.scanner.strip_prefix("~/") {
-            let script = r#"exec python3 -I "$HOME/$1" --from "$2""#;
-            run_command(&["sh", "-c", script, "sh", rest, &who], ctx);
+            let script = r#"f="$HOME/$1"; shift; exec python3 -I "$f" "$@""#;
+            let mut cmd = vec!["sh", "-c", script, "sh", rest];
+            cmd.extend_from_slice(args);
+            run_command(&cmd, ctx);
         } else {
-            run_command(&["python3", "-I", &self.scanner, "--from", &who], ctx);
+            let mut cmd = vec!["python3", "-I", self.scanner.as_str()];
+            cmd.extend_from_slice(args);
+            run_command(&cmd, ctx);
         }
     }
 
@@ -413,6 +468,8 @@ impl State {
                     tab_pos,
                     screen_pos: loc.map(|l| l.2).unwrap_or_default(),
                     local,
+                    seen: a.seen
+                        || a.id.as_ref().is_some_and(|id| self.seen_local.contains(&(id.clone(), a.status_since))),
                     agent: a.clone(),
                 }
             })
@@ -427,6 +484,16 @@ impl State {
                 r.agent.started_at,
             )
         });
+        // focusing a waiting agent reads its question: shared through the scanner so every tab's bar agrees
+        for r in rows.iter_mut().filter(|r| r.focused && r.agent.status == "needs_input" && !r.seen) {
+            r.seen = true;
+            if let Some(id) = r.agent.id.clone() {
+                let ts = r.agent.status_since.to_string();
+                self.run_scanner(&["--seen", &id, &ts], "seen");
+                self.seen_local.insert((id, r.agent.status_since));
+            }
+        }
+        self.seen_local.retain(|k| rows.iter().any(|r| r.agent.id.as_ref() == Some(&k.0) && r.agent.status_since == k.1));
         self.rows = rows;
         if self.selected >= self.rows.len() {
             self.selected = self.rows.len().saturating_sub(1);
@@ -504,11 +571,20 @@ fn sgr(c: PaletteColor, layer: u8) -> String {
     }
 }
 
-fn status_style(status: &str) -> (&'static str, &'static str, &'static str) {
+/// Waiting-for-you colours: amber (not red, which reads as an error). The chip pulses between the two.
+const WAIT_FG: &str = "\x1b[1;38;5;214m";
+const WAIT_BG: &str = "\x1b[1;30;48;5;214m";
+
+/// Spinner for working agents: a quarter-filled circle turning clockwise.
+const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
+/// Seconds per spinner frame.
+const ANIM_STEP: f64 = 0.3;
+
+fn status_style(status: &str, frame: usize) -> (&'static str, &'static str, &'static str) {
     // (icon, label, colour)
     match status {
-        "needs_input" => ("!", "NEEDS YOU", "\x1b[1;37;41m"),
-        "busy" => ("●", "working", "\x1b[33m"),
+        "needs_input" => ("?", "NEEDS YOU", WAIT_FG),
+        "busy" => (SPINNER[frame % SPINNER.len()], "working", "\x1b[33m"),
         "shell" => ("●", "shell", "\x1b[34m"),
         "idle" => ("○", "idle", "\x1b[32m"),
         _ => ("?", "unknown", "\x1b[90m"),
@@ -608,11 +684,11 @@ impl State {
         let mut x = 0usize;
         // header block
         let h0 = format!(" AGENTS {total} ");
-        let h1 = format!(" !{needs} ●{busy} ○{idle} ");
+        let h1 = format!(" ?{needs} ●{busy} ○{idle} ");
         let hw = h0.chars().count().max(h1.chars().count());
         l0.push_str(&format!("{BOLD}{}{RESET}", trunc(&h0, hw)));
-        let needs_style = if needs > 0 { "\x1b[1;31m" } else { DIM };
-        l1.push_str(&format!("{DIM} {needs_style}!{needs}{RESET}{DIM} \x1b[33m●{busy}{RESET}{DIM} \x1b[32m○{idle}{RESET}{}", " ".repeat(hw - h1.chars().count() + 1)));
+        let needs_style = if needs > 0 { WAIT_FG } else { DIM };
+        l1.push_str(&format!("{DIM} {needs_style}?{needs}{RESET}{DIM} \x1b[33m●{busy}{RESET}{DIM} \x1b[32m○{idle}{RESET}{}", " ".repeat(hw - h1.chars().count() + 1)));
         x += hw;
         if let Some(e) = &self.error {
             let e = trunc(e, cols.saturating_sub(x + 3).min(60));
@@ -623,7 +699,7 @@ impl State {
         }
         for i in 0..self.rows.len() {
             let r = &self.rows[i];
-            let (icon, _, color) = status_style(&r.agent.status);
+            let (icon, _, color) = status_style(&r.agent.status, self.frame);
             let ctx = self.ctx_label(&r.agent).map(|c| format!(" {c}")).unwrap_or_default();
             // the number is the Alt+Shift+<n> jump key; ↗ = agent lives in another zellij session
             let remote = if !r.local && r.agent.zellij_session.is_some() { "↗" } else { "" };
@@ -644,22 +720,30 @@ impl State {
             let active = self.active_style.as_deref().unwrap_or(REV);
             // inactive chips: dark grey, so each chip reads as a tab
             let (pre, post) = if r.focused { (active, RESET) } else { ("\x1b[48;5;236m", RESET) };
+            // waiting for you: the whole chip pulses amber (0.6s on, 0.6s off), driven by the spinner clock
+            let waiting = r.agent.status == "needs_input";
+            let on = (self.frame / 2) % 2 == 0;
+            // unread question: the whole chip pulses; read (focused once): only the "?" blinks
+            let pulse = waiting && !r.seen && on;
+            let icon_hidden = waiting && r.seen && !on;
+            let pre = if pulse { WAIT_BG } else { pre };
             l0.push_str(&format!("{DIM}│{RESET}{pre} "));
             l1.push_str(&format!("{DIM}│{RESET}{pre} "));
             x += 2;
             // on the coloured background, status/ctx colours turn unreadable: use the theme's text colour,
             // except the red "needs you" badge and a critical ctx, which must stand out
             let ctx_col = match self.ctx_pct(&r.agent) {
+                _ if pulse => "",
                 Some(p) if p >= 80 => "\x1b[31m",
                 Some(p) if p >= 60 && !r.focused => "\x1b[33m",
                 _ if r.focused => "",
                 _ => DIM,
             };
-            let color = if r.focused && r.agent.status != "needs_input" { BOLD } else { color };
+            let color = if pulse { "" } else if r.focused && !waiting { BOLD } else { color };
             let pad0 = " ".repeat(w - top.chars().count());
-            // SGR 5 = blink: the terminal animates it, no redraw timer needed
-            let blink = if r.agent.status == "needs_input" { "\x1b[5m" } else { "" };
-            l0.push_str(&format!("{pre}{color}{blink}{head}{RESET}{pre}{BOLD}{loc}{RESET}{pre}{ctx_col}{ctx}{RESET}{pre}{pad0} {post}"));
+            // blink "off": the "?" disappears, the orange number stays
+            let head = if icon_hidden { format!(" {}", &head[icon.len()..]) } else { head };
+            l0.push_str(&format!("{pre}{color}{head}{RESET}{pre}{BOLD}{loc}{RESET}{pre}{ctx_col}{ctx}{RESET}{pre}{pad0} {post}"));
             l1.push_str(&format!("{pre}{} {post}", trunc(&purpose, w)));
             self.hits.push((0, x, x + w, i));
             self.hits.push((1, x, x + w, i));
@@ -675,7 +759,7 @@ impl State {
         let now = self.scan.now;
         let _ = writeln!(o, 
             "{BOLD} Agents{RESET} {total}  {}{needs} need you{RESET}  \x1b[33m{busy} working{RESET}  \x1b[32m{idle} idle{RESET}",
-            if needs > 0 { "\x1b[1;31m" } else { DIM }
+            if needs > 0 { WAIT_FG } else { DIM }
         );
         if let Some(e) = &self.error {
             let _ = writeln!(o, "\x1b[31m {}{RESET}", trunc(e, cols.saturating_sub(1)));
@@ -693,7 +777,7 @@ impl State {
         let start = if self.selected >= body { self.selected + 1 - body } else { 0 };
         for (i, r) in self.rows.iter().enumerate().skip(start).take(body) {
             let a = &r.agent;
-            let (icon, label, color) = status_style(&a.status);
+            let (icon, label, color) = status_style(&a.status, self.frame);
             let tab = self.tab_tag(r);
             let loc = self.location(r);
             let ctx = self.ctx_label(a).unwrap_or("-".into());
@@ -704,7 +788,16 @@ impl State {
                 Some(p) if p >= 60 && !sel => "\x1b[33m",
                 _ => "",
             };
-            let color = if sel && a.status != "needs_input" { BOLD } else { color };
+            let waiting = a.status == "needs_input";
+            // unread question: the status cell pulses; read: it stays amber, only the "?" blinks (below)
+            let on = (self.frame / 2) % 2 == 0;
+            let color = if waiting && !r.seen && on {
+                WAIT_BG
+            } else if sel && !waiting {
+                BOLD
+            } else {
+                color
+            };
             let detail = if a.detail.is_empty() {
                 self.purpose(r)
             } else {
@@ -712,10 +805,10 @@ impl State {
             };
             let active = self.active_style.as_deref().unwrap_or(REV);
             let (pre, post) = if sel { (active, RESET) } else { ("", "") };
-            let blink = if a.status == "needs_input" { "\x1b[5m" } else { "" };
+            let icon = if waiting && r.seen && !on { " " } else { icon };
             let marker = if r.focused { format!("▶{:<2}", i + 1) } else { format!(" {:<2}", i + 1) };
             let _ = writeln!(o, 
-                "{pre}{marker} {color}{blink}{icon} {}{RESET}{pre}{}{}{}{ctx_col}{}{RESET}{pre}{}{}{}{post}",
+                "{pre}{marker} {color}{icon} {}{RESET}{pre}{}{}{}{ctx_col}{}{RESET}{pre}{}{}{}{post}",
                 trunc(label, 9),
                 trunc(&tab, 9) + " ",
                 trunc(&loc, 33) + " ",

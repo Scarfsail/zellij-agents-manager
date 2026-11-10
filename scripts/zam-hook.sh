@@ -9,7 +9,7 @@ input=$(cat)
 sid=$(jq -r '.session_id // empty' <<<"$input" 2>/dev/null)
 [[ -z "$sid" || "$sid" == */* ]] && exit 0
 if [[ "$(jq -r '.hook_event_name' <<<"$input")" == "SessionEnd" ]]; then
-  rm -f "$dir/$sid.json"
+  rm -f "$dir/$sid.json" "$dir/../seen/$sid"
   exit 0
 fi
 jq -c --argjson ts "$(date +%s%3N)" '{

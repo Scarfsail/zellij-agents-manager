@@ -22,7 +22,27 @@ import time
 HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(HOME, ".claude"))
 HOOK_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.join(HOME, ".cache")), "zellij-agents", "claude")
+# "read" marks for questions: <session_id> holds the status_since of the question the user has looked at
+SEEN_DIR = os.path.join(os.path.dirname(HOOK_DIR), "seen")
 TAIL_BYTES = 256 * 1024
+
+
+def seen_ts(sid):
+    try:
+        with open(os.path.join(SEEN_DIR, sid)) as f:
+            return int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def mark_seen(sid, ts):
+    if not sid or "/" in sid or sid.startswith("."):
+        return
+    os.makedirs(SEEN_DIR, exist_ok=True)
+    tmp = os.path.join(SEEN_DIR, f".{sid}.tmp")
+    with open(tmp, "w") as f:
+        f.write(str(int(ts)))
+    os.replace(tmp, os.path.join(SEEN_DIR, sid))
 
 
 def proc_env(pid):
@@ -289,6 +309,8 @@ def claude_agents():
             "started_at": s.get("startedAt", 0),
             "status": status,
             "status_since": status_ts,
+            # the user has focused this agent since the current question arrived
+            "seen": status == "needs_input" and seen_ts(s.get("sessionId", "")) >= status_ts,
             "detail": detail,
             # ZELLIJ_SESSION_NAME is frozen at process start; a renamed session would jump to the old name
             "zellij_session": zellij_session_of(pid, env.get("ZELLIJ_SESSION_NAME")) if env.get("ZELLIJ_SESSION_NAME") else None,
@@ -311,6 +333,9 @@ def claude_agents():
 
 
 def main():
+    if len(sys.argv) >= 4 and sys.argv[1] == "--seen":
+        mark_seen(sys.argv[2], sys.argv[3])
+        return
     agents = claude_agents()
     # future: codex_agents(), cursor_agents(), ...
     agents.sort(key=lambda a: a.get("started_at", 0))
