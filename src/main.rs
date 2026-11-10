@@ -72,6 +72,8 @@ struct State {
     hidden: bool,
     /// terminal panes the attached clients are focused on (authoritative; PaneInfo.is_focused goes stale)
     client_focus: Vec<u32>,
+    /// running zellij sessions (SessionUpdate); None until the first update arrives
+    live_sessions: Option<Vec<String>>,
     error: Option<String>,
 }
 
@@ -98,6 +100,7 @@ impl Default for State {
             last_scan_tick: 0,
             hidden: false,
             client_focus: Vec::new(),
+            live_sessions: None,
             error: None,
         }
     }
@@ -136,6 +139,7 @@ impl ZellijPlugin for State {
             EventType::Mouse,
             EventType::Key,
             EventType::ListClients,
+            EventType::SessionUpdate,
         ]);
     }
 
@@ -210,6 +214,10 @@ impl ZellijPlugin for State {
                     self.rebuild();
                     return true;
                 }
+                false
+            }
+            Event::SessionUpdate(sessions, _) => {
+                self.live_sessions = Some(sessions.into_iter().map(|s| s.name).collect());
                 false
             }
             Event::RunCommandResult(code, out, err, ctx) => {
@@ -312,7 +320,7 @@ impl ZellijPlugin for State {
             }
             None => {}
         }
-        false
+        self.error.is_some() // redraw so "session … is not running" shows
     }
 
     fn render(&mut self, rows: usize, cols: usize) {
@@ -447,7 +455,13 @@ impl State {
         if row.local {
             focus_terminal_pane(pane, false, false);
         } else if let Some(s) = &row.agent.zellij_session {
-            switch_session_with_focus(s, None, Some((pane, false)));
+            // switching to a name that isn't running would silently create an empty session
+            if self.live_sessions.as_ref().map_or(true, |live| live.contains(s)) {
+                switch_session_with_focus(s, None, Some((pane, false)));
+            } else {
+                self.error = Some(format!("session {s} is not running"));
+                return;
+            }
         }
         if self.mode == Mode::Panel && self.hide_on_jump {
             hide_self();

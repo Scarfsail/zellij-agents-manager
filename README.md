@@ -13,7 +13,7 @@ No setup is needed for the basics. `scripts/zam-scan.py` (run by the plugin ever
 
 1. reads `~/.claude/sessions/<pid>.json` (Claude Code writes `status` = `busy`/`idle`/`shell`, `cwd`, `name`, `startedAt`),
 2. drops dead processes (checks `/proc/<pid>/stat` start time against `procStart` to survive pid reuse),
-3. reads `ZELLIJ_SESSION_NAME`/`ZELLIJ_PANE_ID` from `/proc/<pid>/environ` (that is the jump target),
+3. reads `ZELLIJ_PANE_ID` from `/proc/<pid>/environ` and finds the agent's session by walking up to the Zellij server process it runs under (that is the jump target). `ZELLIJ_SESSION_NAME` in the environment is frozen at start and goes stale when a session is renamed; the current name is the server's socket file name, matched to the server pid via `SO_PEERCRED` once a rename is detected,
 4. computes context usage like Claude Code does: tokens of the last request (`input + cache_read + cache_creation` from the transcript) divided by that model's `max_input_tokens` from Claude Code's own model catalog cache (`~/.claude/cache/model-catalog/`), rounded and clamped to 0–100, which is the same formula Claude Code uses for the statusline's `used_percentage` (honours `CLAUDE_CODE_MAX_CONTEXT_TOKENS` + `DISABLE_COMPACT` from the agent's env). No Claude settings or statusline needed. If a model isn't in the catalog, the raw token count is shown instead of a guessed %.
 
 The plugin joins this with `PaneUpdate`/`TabUpdate` to learn the tab and the pane title (Claude puts the task summary there), and jumps with `focus_terminal_pane` (switches tab, unstacks, shows floating). Agents in another Zellij session are listed with `↗ session` and jump via `switch_session_with_focus`.
