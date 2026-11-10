@@ -74,6 +74,8 @@ struct State {
     client_focus: Vec<u32>,
     /// running zellij sessions (SessionUpdate); None until the first update arrives
     live_sessions: Option<Vec<String>>,
+    /// SGR for the focused chip, from zellij's theme (ribbon_selected = the active tab's colours)
+    active_style: Option<String>,
     error: Option<String>,
 }
 
@@ -101,6 +103,7 @@ impl Default for State {
             hidden: false,
             client_focus: Vec::new(),
             live_sessions: None,
+            active_style: None,
             error: None,
         }
     }
@@ -159,7 +162,10 @@ impl ZellijPlugin for State {
                 true
             }
             Event::ModeUpdate(mi) => {
-                let changed = self.session != mi.session_name;
+                let rs = &mi.style.colors.ribbon_selected;
+                let style = Some(format!("\x1b[{};{}m", sgr(rs.base, 38), sgr(rs.background, 48)));
+                let changed = self.session != mi.session_name || self.active_style != style;
+                self.active_style = style;
                 self.session = mi.session_name;
                 if changed {
                     self.rebuild();
@@ -490,6 +496,14 @@ const DIM: &str = "\x1b[2m";
 const BOLD: &str = "\x1b[1m";
 const REV: &str = "\x1b[7m";
 
+/// SGR parameters for a theme colour; `layer` is 38 (fg) or 48 (bg).
+fn sgr(c: PaletteColor, layer: u8) -> String {
+    match c {
+        PaletteColor::Rgb((r, g, b)) => format!("{layer};2;{r};{g};{b}"),
+        PaletteColor::EightBit(n) => format!("{layer};5;{n}"),
+    }
+}
+
 fn status_style(status: &str) -> (&'static str, &'static str, &'static str) {
     // (icon, label, colour)
     match status {
@@ -626,23 +640,29 @@ impl State {
                 l0.push_str(&format!("{DIM}{tag}{RESET}"));
                 break;
             }
-            let (pre, post) = if r.focused { (REV, RESET) } else { ("", "") };
-            l0.push_str(&format!("{DIM} │ {RESET}"));
-            l1.push_str(&format!("{DIM} │ {RESET}"));
-            x += 3;
+            // focused chip = zellij's active-tab colours; its padding spaces carry the background too
+            let active = self.active_style.as_deref().unwrap_or(REV);
+            let (pre, post) = if r.focused { (active, RESET) } else { ("", "") };
+            l0.push_str(&format!("{DIM}│{RESET}{pre} "));
+            l1.push_str(&format!("{DIM}│{RESET}{pre} "));
+            x += 2;
+            // on the coloured background, status/ctx colours turn unreadable: use the theme's text colour,
+            // except the red "needs you" badge and a critical ctx, which must stand out
             let ctx_col = match self.ctx_pct(&r.agent) {
                 Some(p) if p >= 80 => "\x1b[31m",
-                Some(p) if p >= 60 => "\x1b[33m",
+                Some(p) if p >= 60 && !r.focused => "\x1b[33m",
+                _ if r.focused => "",
                 _ => DIM,
             };
+            let color = if r.focused && r.agent.status != "needs_input" { BOLD } else { color };
             let pad0 = " ".repeat(w - top.chars().count());
             // SGR 5 = blink: the terminal animates it, no redraw timer needed
             let blink = if r.agent.status == "needs_input" { "\x1b[5m" } else { "" };
-            l0.push_str(&format!("{pre}{color}{blink}{head}{RESET}{pre}{BOLD}{loc}{RESET}{pre}{ctx_col}{ctx}{RESET}{pre}{pad0}{post}"));
-            l1.push_str(&format!("{pre}{}{post}", trunc(&purpose, w)));
+            l0.push_str(&format!("{pre}{color}{blink}{head}{RESET}{pre}{BOLD}{loc}{RESET}{pre}{ctx_col}{ctx}{RESET}{pre}{pad0} {post}"));
+            l1.push_str(&format!("{pre}{} {post}", trunc(&purpose, w)));
             self.hits.push((0, x, x + w, i));
             self.hits.push((1, x, x + w, i));
-            x += w;
+            x += w + 1;
         }
         format!("{l0}\n{l1}")
     }
@@ -676,18 +696,21 @@ impl State {
             let tab = self.tab_tag(r);
             let loc = self.location(r);
             let ctx = self.ctx_label(a).unwrap_or("-".into());
+            let sel = i == self.selected;
+            // selected row = zellij's active-tab colours, same rules as the bar's focused chip
             let ctx_col = match self.ctx_pct(a) {
                 Some(p) if p >= 80 => "\x1b[31m",
-                Some(p) if p >= 60 => "\x1b[33m",
+                Some(p) if p >= 60 && !sel => "\x1b[33m",
                 _ => "",
             };
+            let color = if sel && a.status != "needs_input" { BOLD } else { color };
             let detail = if a.detail.is_empty() {
                 self.purpose(r)
             } else {
                 format!("{} · {}", self.purpose(r), a.detail)
             };
-            let sel = i == self.selected;
-            let (pre, post) = if sel { (REV, RESET) } else { ("", "") };
+            let active = self.active_style.as_deref().unwrap_or(REV);
+            let (pre, post) = if sel { (active, RESET) } else { ("", "") };
             let blink = if a.status == "needs_input" { "\x1b[5m" } else { "" };
             let marker = if r.focused { format!("▶{:<2}", i + 1) } else { format!(" {:<2}", i + 1) };
             let _ = writeln!(o, 
