@@ -642,7 +642,8 @@ impl State {
             }
             // focused chip = zellij's active-tab colours; its padding spaces carry the background too
             let active = self.active_style.as_deref().unwrap_or(REV);
-            let (pre, post) = if r.focused { (active, RESET) } else { ("", "") };
+            // inactive chips: dark grey, so each chip reads as a tab
+            let (pre, post) = if r.focused { (active, RESET) } else { ("\x1b[48;5;236m", RESET) };
             l0.push_str(&format!("{DIM}│{RESET}{pre} "));
             l1.push_str(&format!("{DIM}│{RESET}{pre} "));
             x += 2;
