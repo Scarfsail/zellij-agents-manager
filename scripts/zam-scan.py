@@ -35,6 +35,8 @@ SEEN_DIR = os.path.join(os.path.dirname(HOOK_DIR), "seen")
 CURSOR_DIR = os.path.join(os.path.dirname(HOOK_DIR), "cursor")
 CURSOR_CHATS = os.path.join(HOME, ".cursor", "chats")
 TAIL_BYTES = 256 * 1024
+# Without hooks, a Cursor agent counts as busy while its chat db was written within this many seconds
+CURSOR_BUSY_WINDOW_S = 4
 
 
 def seen_ts(sid):
@@ -522,7 +524,7 @@ def cursor_agents():
                 detail = st.get("tool", "") if st["event"] != "beforeSubmitPrompt" else ""
             else:
                 mt = max((os.path.getmtime(p) for p in (db, db + "-wal") if os.path.exists(p)), default=0)
-                status, status_ts = ("busy" if time.time() - mt < 10 else "idle"), int(mt * 1000)
+                status, status_ts = ("busy" if time.time() - mt < CURSOR_BUSY_WINDOW_S else "idle"), int(mt * 1000)
             name = m.get("name") or ""
             a = {
                 "kind": "cursor",

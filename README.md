@@ -22,7 +22,7 @@ Optional hooks (`scripts/install-hooks.sh`) add the **NEEDS YOU** state (permiss
 
 ### Cursor
 
-Cursor CLI (`cursor-agent`) writes no live session file, so the scanner finds its processes in `/proc` (cmdline contains `cursor-agent/versions/…/index.js`) and follows the `~/.cursor/chats/<hash>/<agentId>/store.db` each one keeps open to the chat's `meta.json` (cwd) and the `store.db` meta row (agent id, name, last model). Pane and session come from the environment as for Claude. Without setup, an agent counts as busy while its `store.db` was written in the last 10 s.
+Cursor CLI (`cursor-agent`) writes no live session file, so the scanner finds its processes in `/proc` (cmdline contains `cursor-agent/versions/…/index.js`) and follows the `~/.cursor/chats/<hash>/<agentId>/store.db` each one keeps open to the chat's `meta.json` (cwd) and the `store.db` meta row (agent id, name, last model). Pane and session come from the environment as for Claude. Without setup, an agent counts as busy while its `store.db` was written in the last 4 s.
 
 `scripts/install-cursor.sh` (idempotent, `.zam.bak` backups, `--uninstall` to undo; restart running agents afterwards) wires the scanner into Cursor:
 
