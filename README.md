@@ -1,6 +1,6 @@
 # zellij-agents
 
-A Zellij plugin that shows every running coding agent (Claude Code today; Codex/Cursor/agy later) across tabs, stacks and floating panes, with its status, context usage and age, and jumps to its pane on click/enter.
+A Zellij plugin that shows every running coding agent (Claude Code and Cursor CLI today; Codex/agy later) across tabs, stacks and floating panes, with its status, context usage and age, and jumps to its pane on click/enter.
 
 One WASM binary, two modes:
 
@@ -19,6 +19,17 @@ No setup is needed for the basics. `scripts/zam-scan.py` (run by the plugin ever
 The plugin joins this with `PaneUpdate`/`TabUpdate` to learn the tab and the pane title (Claude puts the task summary there), and jumps with `focus_terminal_pane` (switches tab, unstacks, shows floating). Agents in another Zellij session are listed with `↗ session` and jump via `switch_session_with_focus`.
 
 Optional hooks (`scripts/install-hooks.sh`) add the **NEEDS YOU** state (permission prompt) and the current tool name, which the session file alone can't tell apart from "busy".
+
+### Cursor
+
+Cursor CLI (`cursor-agent`) writes no live session file, so the scanner finds its processes in `/proc` (cmdline contains `cursor-agent/versions/…/index.js`) and follows the `~/.cursor/chats/<hash>/<agentId>/store.db` each one keeps open to the chat's `meta.json` (cwd) and the `store.db` meta row (agent id, name, last model). Pane and session come from the environment as for Claude. Without setup, an agent counts as busy while its `store.db` was written in the last 10 s.
+
+`scripts/install-cursor.sh` (idempotent, `.zam.bak` backups, `--uninstall` to undo; restart running agents afterwards) wires the scanner into Cursor:
+
+- **hooks** in `~/.cursor/hooks.json` (`beforeSubmitPrompt`, `preToolUse`, `postToolUse`, `postToolUseFailure`, `stop`, `sessionEnd` → `zam-scan.py --cursor-hook`) give exact busy/idle and the current tool. Existing hooks are kept.
+- **status line** in `~/.cursor/cli-config.json` (`zam-scan.py --cursor-statusline`) records Cursor's own context %. If you already have a status line command, it is chained: it gets the same input and its output is still shown. If you had none, the installed one prints nothing and Cursor's status line area stays blank: it only records context and chains to a previous command.
+
+Both write `~/.cache/zellij-agents/cursor/<agent pid>.json`; the hook/status line process finds its agent by walking up its parent processes. Cursor has no permission-prompt hook, so a Cursor agent never shows **NEEDS YOU**.
 
 ## Build
 
