@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use zellij_tile::prelude::*;
 
 // ---------- data from the scanner ----------
@@ -604,17 +605,32 @@ fn ago(now: i64, ts: i64) -> String {
     }
 }
 
+/// Terminal cell width (emoji such as ✅ take 2 cells), matching how zellij lays text out.
+fn dw(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
+
+/// Fit `s` into exactly `w` cells: pad with spaces, or cut and end with "…".
 fn trunc(s: &str, w: usize) -> String {
-    let n = s.chars().count();
-    if n <= w {
-        format!("{s:<w$}")
-    } else if w == 0 {
-        String::new()
-    } else {
-        let mut t: String = s.chars().take(w - 1).collect();
-        t.push('…');
-        t
+    if dw(s) <= w {
+        return format!("{s}{}", " ".repeat(w - dw(s)));
     }
+    if w == 0 {
+        return String::new();
+    }
+    let mut t = String::new();
+    let mut used = 0;
+    for c in s.chars() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + cw > w - 1 {
+            break;
+        }
+        t.push(c);
+        used += cw;
+    }
+    t.push('…');
+    t.push_str(&" ".repeat(w - 1 - used));
+    t
 }
 
 fn short_model(m: &Option<String>) -> String {
@@ -685,14 +701,14 @@ impl State {
         // header block
         let h0 = format!(" AGENTS {total} ");
         let h1 = format!(" ?{needs} ●{busy} ○{idle} ");
-        let hw = h0.chars().count().max(h1.chars().count());
+        let hw = dw(&h0).max(dw(&h1));
         l0.push_str(&format!("{BOLD}{}{RESET}", trunc(&h0, hw)));
         let needs_style = if needs > 0 { WAIT_FG } else { DIM };
-        l1.push_str(&format!("{DIM} {needs_style}?{needs}{RESET}{DIM} \x1b[33m●{busy}{RESET}{DIM} \x1b[32m○{idle}{RESET}{}", " ".repeat(hw - h1.chars().count() + 1)));
+        l1.push_str(&format!("{DIM} {needs_style}?{needs}{RESET}{DIM} \x1b[33m●{busy}{RESET}{DIM} \x1b[32m○{idle}{RESET}{}", " ".repeat(hw - dw(&h1) + 1)));
         x += hw;
         if let Some(e) = &self.error {
             let e = trunc(e, cols.saturating_sub(x + 3).min(60));
-            let w = e.chars().count();
+            let w = dw(&e);
             l0.push_str(&format!("{DIM}│{RESET} \x1b[31m{e}{RESET} "));
             l1.push_str(&format!("{DIM}│{RESET} {} ", " ".repeat(w)));
             x += w + 3;
@@ -704,13 +720,13 @@ impl State {
             // the number is the Alt+Shift+<n> jump key; ↗ = agent lives in another zellij session
             let remote = if !r.local && r.agent.zellij_session.is_some() { "↗" } else { "" };
             let head = format!("{icon} {}{remote} ", i + 1);
-            let loc_w = CHIP_MAX.saturating_sub(head.chars().count() + ctx.chars().count());
+            let loc_w = CHIP_MAX.saturating_sub(dw(&head) + dw(&ctx));
             let loc = trunc(&self.location(r), loc_w).trim_end().to_string();
             let top = format!("{head}{loc}{ctx}");
             let purpose = self.purpose(r);
-            let w = top.chars().count().max(purpose.chars().count().min(CHIP_MAX));
+            let w = dw(&top).max(dw(&purpose).min(CHIP_MAX));
             let remaining = self.rows.len() - i;
-            let more = if remaining > 1 { format!(" +{}", remaining - 1).chars().count() } else { 0 };
+            let more = if remaining > 1 { dw(&format!(" +{}", remaining - 1)) } else { 0 };
             if x + 3 + w + more > cols {
                 let tag = format!(" +{remaining}");
                 l0.push_str(&format!("{DIM}{tag}{RESET}"));
@@ -740,7 +756,7 @@ impl State {
                 _ => DIM,
             };
             let color = if pulse { "" } else if r.focused && !waiting { BOLD } else { color };
-            let pad0 = " ".repeat(w - top.chars().count());
+            let pad0 = " ".repeat(w - dw(&top));
             // blink "off": the "?" disappears, the orange number stays
             let head = if icon_hidden { format!(" {}", &head[icon.len()..]) } else { head };
             l0.push_str(&format!("{pre}{color}{head}{RESET}{pre}{BOLD}{loc}{RESET}{pre}{ctx_col}{ctx}{RESET}{pre}{pad0} {post}"));
