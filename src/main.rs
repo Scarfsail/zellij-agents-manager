@@ -56,6 +56,8 @@ struct Row {
 
 struct State {
     mode: Mode,
+    /// our layout config, passed on (with mode=panel) to the panel the header toggles
+    cfg: BTreeMap<String, String>,
     scanner: String,
     interval: f64,
     hide_on_jump: bool,
@@ -68,6 +70,8 @@ struct State {
     selected: usize,
     // clickable regions from the last render: (line, col_start, col_end, row index)
     hits: Vec<(usize, usize, usize, usize)>,
+    /// width of the bar's header block from the last render (clicking it toggles the panel)
+    header_w: usize,
     permitted: bool,
     scanning: bool,
     my_id: u32,
@@ -97,6 +101,7 @@ impl Default for State {
     fn default() -> Self {
         Self {
             mode: Mode::Bar,
+            cfg: BTreeMap::new(),
             scanner: "zam-scan.py".into(),
             interval: 2.0,
             hide_on_jump: true,
@@ -108,6 +113,7 @@ impl Default for State {
             rows: vec![],
             selected: 0,
             hits: vec![],
+            header_w: 0,
             permitted: false,
             scanning: false,
             my_id: 0,
@@ -145,11 +151,13 @@ impl ZellijPlugin for State {
         if let Some(h) = cfg.get("hide_on_jump") {
             self.hide_on_jump = h != "false";
         }
+        self.cfg = cfg;
         self.my_id = get_plugin_ids().plugin_id;
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
             PermissionType::RunCommands,
+            PermissionType::MessageAndLaunchOtherPlugins,
         ]);
         subscribe(&[
             EventType::PermissionRequestResult,
@@ -200,12 +208,8 @@ impl ZellijPlugin for State {
                 true
             }
             Event::PaneUpdate(pm) => {
-                self.my_tab = pm
-                    .panes
-                    .iter()
-                    .find(|(_, ps)| ps.iter().any(|p| p.is_plugin && p.id == self.my_id))
-                    .map(|(t, _)| *t);
                 self.panes = pm;
+                self.my_tab = self.my_pane().map(|(t, _)| t);
                 self.rebuild();
                 list_clients();
                 true
@@ -292,6 +296,10 @@ impl ZellijPlugin for State {
                     return false;
                 }
                 let (line, col) = (line as usize, col);
+                if self.mode == Mode::Bar && line < 2 && col < self.header_w {
+                    self.toggle_panel();
+                    return false;
+                }
                 if let Some(&(_, _, _, idx)) =
                     self.hits.iter().find(|(l, a, b, _)| *l == line && col >= *a && col < *b)
                 {
@@ -334,11 +342,19 @@ impl ZellijPlugin for State {
     /// Keybindings broadcast `MessagePlugin { name "zam_jump"; payload "<n>" }` to every plugin;
     /// only the instance on screen acts, so each press jumps once.
     fn pipe(&mut self, msg: PipeMessage) -> bool {
+        // the bar's header (click or Ctrl+Alt+0) asks the panel to toggle; a hidden panel must still act
+        if msg.name == "zam_panel" {
+            if self.mode == Mode::Panel {
+                self.toggle_self(msg.args.get("tab").and_then(|t| t.parse().ok()));
+            }
+            return false;
+        }
         // my_tab None = this instance hasn't learned where it is yet (e.g. never-visited tab): don't act
         if msg.name != "zam_jump" || self.hidden || self.my_tab.is_none() || !self.permitted {
             return false;
         }
         match msg.payload.as_deref().map(str::trim) {
+            Some("panel") if self.mode == Mode::Bar => self.toggle_panel(),
             Some("next") => {
                 if let Some(i) = self.next_attention() {
                     self.selected = i;
@@ -369,6 +385,7 @@ impl ZellijPlugin for State {
 
     fn render(&mut self, rows: usize, cols: usize) {
         self.hits.clear();
+        self.header_w = 0;
         let frame = match self.mode {
             Mode::Bar => self.render_bar(cols),
             Mode::Panel => self.render_panel(rows, cols),
@@ -404,6 +421,55 @@ impl State {
             .iter()
             .find(|(_, ps)| ps.iter().any(|p| p.is_plugin == plugin && p.id == id))
             .map(|(t, _)| *t)
+    }
+
+    /// our own plugin pane and the tab it sits in
+    fn my_pane(&self) -> Option<(usize, &PaneInfo)> {
+        self.panes
+            .panes
+            .iter()
+            .find_map(|(t, ps)| ps.iter().find(|p| p.is_plugin && p.id == self.my_id).map(|p| (*t, p)))
+    }
+
+    /// Bar: ask the panel (same plugin, our config with mode=panel) to toggle; Zellij launches it floating if none runs.
+    fn toggle_panel(&self) {
+        let Some((tab, Some(url))) = self.my_pane().map(|(t, p)| (t, p.plugin_url.clone())) else {
+            return;
+        };
+        if !self.permitted {
+            return;
+        }
+        let mut cfg = self.cfg.clone();
+        cfg.insert("mode".into(), "panel".into());
+        let args = BTreeMap::from([("tab".to_string(), tab.to_string())]);
+        pipe_message_to_plugin(
+            MessageToPlugin::new("zam_panel")
+                .with_plugin_url(url)
+                .with_plugin_config(cfg)
+                .with_payload("toggle")
+                .with_args(args)
+                .new_plugin_instance_should_float(true),
+        );
+    }
+
+    /// Panel: hide if on screen in the bar's tab, else show. A just-launched panel has no PaneInfo yet and takes
+    /// the show branch; show_self unsuppresses, focuses and switches to the panel's tab, which is harmless for a
+    /// just-launched, already-visible panel (in another tab it switches the user there, an accepted risk).
+    /// The cached `is_suppressed` is updated right away so a quick second toggle sees the new state before the next PaneUpdate.
+    fn toggle_self(&mut self, tab: Option<usize>) {
+        let floating_visible = |t: usize| self.tabs.iter().any(|ti| ti.position == t && ti.are_floating_panes_visible);
+        let on_screen = self
+            .my_pane()
+            .is_some_and(|(t, p)| !p.is_suppressed && Some(t) == tab && (!p.is_floating || floating_visible(t)));
+        if on_screen {
+            hide_self();
+        } else {
+            show_self(true);
+        }
+        let my_id = self.my_id;
+        if let Some(p) = self.panes.panes.values_mut().flatten().find(|p| p.is_plugin && p.id == my_id) {
+            p.is_suppressed = on_screen;
+        }
     }
 
     fn arm(&mut self, step: f64) {
@@ -706,6 +772,7 @@ impl State {
         let needs_style = if needs > 0 { WAIT_FG } else { DIM };
         l1.push_str(&format!("{DIM} {needs_style}?{needs}{RESET}{DIM} \x1b[33m●{busy}{RESET}{DIM} \x1b[32m○{idle}{RESET}{}", " ".repeat(hw - dw(&h1) + 1)));
         x += hw;
+        self.header_w = hw;
         if let Some(e) = &self.error {
             let e = trunc(e, cols.saturating_sub(x + 3).min(60));
             let w = dw(&e);
