@@ -76,6 +76,8 @@ struct State {
     scanning: bool,
     my_id: u32,
     my_tab: Option<usize>,
+    /// Panel: (stable tab id of the bar's tab we were asked to show in, break already sent), until shown there
+    follow: Option<(usize, bool)>,
     ticks: u64,
     last_scan_tick: u64,
     /// spinner frame for working agents, derived from the clock so stray ticks can't speed it up
@@ -118,6 +120,7 @@ impl Default for State {
             scanning: false,
             my_id: 0,
             my_tab: None,
+            follow: None,
             ticks: 1,
             last_scan_tick: 0,
             frame: 0,
@@ -203,6 +206,7 @@ impl ZellijPlugin for State {
             }
             Event::TabUpdate(tabs) => {
                 self.tabs = tabs;
+                self.follow_tab();
                 self.rebuild();
                 list_clients(); // tab switch: re-check visibility right away
                 true
@@ -210,6 +214,7 @@ impl ZellijPlugin for State {
             Event::PaneUpdate(pm) => {
                 self.panes = pm;
                 self.my_tab = self.my_pane().map(|(t, _)| t);
+                self.follow_tab();
                 self.rebuild();
                 list_clients();
                 true
@@ -345,7 +350,7 @@ impl ZellijPlugin for State {
         // the bar's header (click or Ctrl+Alt+0) asks the panel to toggle; a hidden panel must still act
         if msg.name == "zam_panel" {
             if self.mode == Mode::Panel {
-                self.toggle_self(msg.args.get("tab").and_then(|t| t.parse().ok()));
+                self.toggle_self(msg.args.get("tab_id").and_then(|t| t.parse().ok()));
             }
             return false;
         }
@@ -431,7 +436,13 @@ impl State {
             .find_map(|(t, ps)| ps.iter().find(|p| p.is_plugin && p.id == self.my_id).map(|p| (*t, p)))
     }
 
-    /// Bar: ask the panel (same plugin, our config with mode=panel) to toggle; Zellij launches it floating if none runs.
+    /// stable `TabInfo.tab_id` of the tab at `position` (PaneManifest keys are positions, which shift on close/reorder)
+    fn tab_id_at(&self, position: usize) -> Option<usize> {
+        self.tabs.iter().find(|ti| ti.position == position).map(|ti| ti.tab_id)
+    }
+
+    /// Bar: ask the panel (same plugin, our config with mode=panel) to toggle in our tab, passed by stable tab id
+    /// (none if not yet known: the panel then just shows itself); Zellij launches it floating if none runs.
     fn toggle_panel(&self) {
         let Some((tab, Some(url))) = self.my_pane().map(|(t, p)| (t, p.plugin_url.clone())) else {
             return;
@@ -441,7 +452,7 @@ impl State {
         }
         let mut cfg = self.cfg.clone();
         cfg.insert("mode".into(), "panel".into());
-        let args = BTreeMap::from([("tab".to_string(), tab.to_string())]);
+        let args = BTreeMap::from_iter(self.tab_id_at(tab).map(|id| ("tab_id".to_string(), id.to_string())));
         pipe_message_to_plugin(
             MessageToPlugin::new("zam_panel")
                 .with_plugin_url(url)
@@ -452,23 +463,56 @@ impl State {
         );
     }
 
-    /// Panel: hide if on screen in the bar's tab, else show. A just-launched panel has no PaneInfo yet and takes
-    /// the show branch; show_self unsuppresses, focuses and switches to the panel's tab, which is harmless for a
-    /// just-launched, already-visible panel (in another tab it switches the user there, an accepted risk).
+    /// Panel: hide if on screen in the bar's tab (`tab_id`), else show it there (see `follow_tab`), never switching the
+    /// user to another tab. Without a tab id, plain show (show_self may switch tabs). A just-launched panel has no
+    /// PaneInfo yet and takes the show branch; it is moved once its PaneInfo and tab id are known.
     /// The cached `is_suppressed` is updated right away so a quick second toggle sees the new state before the next PaneUpdate.
-    fn toggle_self(&mut self, tab: Option<usize>) {
+    fn toggle_self(&mut self, tab_id: Option<usize>) {
         let floating_visible = |t: usize| self.tabs.iter().any(|ti| ti.position == t && ti.are_floating_panes_visible);
-        let on_screen = self
-            .my_pane()
-            .is_some_and(|(t, p)| !p.is_suppressed && Some(t) == tab && (!p.is_floating || floating_visible(t)));
+        let on_screen = self.my_pane().is_some_and(|(t, p)| {
+            !p.is_suppressed && tab_id.is_some() && self.tab_id_at(t) == tab_id && (!p.is_floating || floating_visible(t))
+        });
         if on_screen {
+            self.follow = None;
             hide_self();
+        } else if tab_id.is_some() {
+            self.follow = tab_id.map(|id| (id, false));
+            self.follow_tab();
         } else {
+            self.follow = None;
             show_self(true);
         }
         let my_id = self.my_id;
         if let Some(p) = self.panes.panes.values_mut().flatten().find(|p| p.is_plugin && p.id == my_id) {
             p.is_suppressed = on_screen;
+        }
+    }
+
+    /// Panel (on PaneUpdate/TabUpdate): bring ourselves into the wanted tab as a floating pane and show there. show_self
+    /// focuses and switches to the pane's own tab, so it is called only once we are in the wanted tab (the user's, so no
+    /// switch). The move is sent at most once per show; if Zellij refuses it we just show where we are.
+    fn follow_tab(&mut self) {
+        let Some((want, moved)) = self.follow else {
+            return;
+        };
+        // wait for our PaneInfo and the tab list (a fresh instance may get them in either order)
+        let Some((here, floating)) = self.my_pane().and_then(|(t, p)| Some((self.tab_id_at(t)?, p.is_floating))) else {
+            return;
+        };
+        let me = PaneId::Plugin(self.my_id);
+        if here == want {
+            if !floating {
+                float_multiple_panes(vec![me]);
+            }
+            show_self(true);
+            self.follow = None;
+        } else if !moved {
+            if break_panes_to_tab_with_id(&[me], want, false).is_some() {
+                self.follow = Some((want, true));
+            } else {
+                show_self(true);
+                self.follow = None;
+            }
         }
     }
 
