@@ -49,7 +49,7 @@ Needs rustup + `wasm32-wasip1`. Without a system C compiler it uses zig from `~/
 
 On another machine: clone the repo anywhere, run `./install.sh`, start a new session. Needs Zellij 0.45 and `python3`; the built `dist/zellij-agents.wasm` is committed, so Rust is only needed to change the plugin. If there is no `config.kdl` yet, one is created holding only the jump keys (Zellij's defaults stay in effect). If `config.kdl` already sets another `default_layout`, the script installs the keys and layouts and asks you to switch the layout yourself.
 
-On first start the bar asks for permissions (read state, change state, run commands, message and launch other plugins; the last one opens the panel from the header): click it and press `y`. Zellij remembers this per plugin path; bars that were already open in other tabs ask once too.
+On first start the bar asks for permissions (read state, change state, run commands): click it and press `y`. Zellij remembers this per plugin path; bars that were already open in other tabs ask once too.
 
 The layout is generated from zellij's own default layout and swap layouts, with the bar added under the tab bar. It points at this checkout, so `./build.sh` updates new sessions directly. Existing sessions keep their layout; start a new session (or `zellij action new-tab --layout agents`) to get the bar.
 
@@ -98,7 +98,7 @@ Panel as a floating window in the current session:
 zellij plugin --floating --configuration "mode=panel,scanner=$PWD/scripts/zam-scan.py" -- "file:$PWD/dist/zellij-agents.wasm"
 ```
 
-Zellij asks for permissions on first load (read state, change state, run commands, message and launch other plugins); press `y`.
+Zellij asks for permissions on first load (read state, change state, run commands); press `y`.
 
 Clicking the bar's header (or `Ctrl+Alt+0`) toggles the panel without any setup: it opens a floating panel with the bar's own config and `mode=panel`. A keybinding of your own for the panel (add to the `shared_except "locked"` block of `config.kdl`):
 
