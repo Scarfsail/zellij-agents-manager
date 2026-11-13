@@ -105,6 +105,8 @@ struct State {
     scanner: String,
     interval: f64,
     hide_on_jump: bool,
+    /// the bar asks the scanner for system notifications on status changes
+    notify: bool,
     debug_dump: Option<String>,
     session: Option<String>,
     tabs: Vec<TabInfo>,
@@ -154,6 +156,7 @@ impl Default for State {
             scanner: "zam-scan.py".into(),
             interval: 2.0,
             hide_on_jump: true,
+            notify: true,
             debug_dump: None,
             session: None,
             tabs: vec![],
@@ -205,6 +208,9 @@ impl ZellijPlugin for State {
         self.debug_dump = cfg.get("debug_dump").cloned();
         if let Some(h) = cfg.get("hide_on_jump") {
             self.hide_on_jump = h != "false";
+        }
+        if let Some(n) = cfg.get("notify") {
+            self.notify = n != "false";
         }
         self.cfg = cfg;
         self.my_id = get_plugin_ids().plugin_id;
@@ -585,9 +591,14 @@ impl State {
         }
         self.scanning = true;
         self.last_scan_tick = self.ticks;
-        // trailing args are ignored by the scanner; they show up in `ps` and help debugging
+        // the scanner ignores --from; it shows up in `ps` and helps debugging
         let who = format!("id={}", self.my_id);
-        self.run_scanner(&["--from", &who], "scan");
+        let mut args = vec!["--from", who.as_str()];
+        // only bars notify: the panel is transient and would ignore the bar's `notify false`
+        if self.mode == Mode::Bar && self.notify {
+            args.push("--notify");
+        }
+        self.run_scanner(&args, "scan");
     }
 
     fn run_scanner(&self, args: &[&str], tag: &str) {
