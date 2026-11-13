@@ -5,7 +5,7 @@ A Zellij plugin that shows every running coding agent (Claude Code and Cursor CL
 One WASM binary, two modes:
 
 - **`bar`**: a 2-row strip under the native tab bar. Each chip shows the agent number, status, repo@branch and context % on the first row and the session title on the second. Click a chip, or press `Ctrl+Alt+<number>`, to jump; `Ctrl+Alt+←/→` goes to the previous/next agent. The chip of the focused agent is reversed; `↗` marks an agent in another Zellij session. A working agent shows a spinning `◐`; the chip of an agent waiting on you shows `?` and pulses amber until you focus it; after that only the `?` pulses, until it asks something new (needs the hooks below).
-- **`panel`**: a full table (status, name, tab, time in status, ctx %, model, uptime, task title from the pane). `j/k` select, `enter`/click jump, `n` jump to the next agent waiting on you, `q`/`esc` hide. Best as a floating pane toggled by a key.
+- **`panel`**: a full table (status, name, tab, time in status, ctx %, model, uptime, task title from the pane). `j/k` select, `enter`/click jump, `n` jump to the next agent waiting on you, `q`/`esc` close. Clicking the bar's header block (` AGENTS N `) or `Ctrl+Alt+0` toggles it as a floating pane right below the bar, or bind a key yourself (below).
 
 ## How detection works
 
@@ -49,7 +49,7 @@ Needs rustup + `wasm32-wasip1`. Without a system C compiler it uses zig from `~/
 
 On another machine: clone the repo anywhere, run `./install.sh`, start a new session. Needs Zellij 0.45 and `python3`; the built `dist/zellij-agents.wasm` is committed, so Rust is only needed to change the plugin. If there is no `config.kdl` yet, one is created holding only the jump keys (Zellij's defaults stay in effect). If `config.kdl` already sets another `default_layout`, the script installs the keys and layouts and asks you to switch the layout yourself.
 
-On first start the bar asks for permissions (read state, change state, run commands): click it and press `y`. Zellij remembers this per plugin path; bars that were already open in other tabs ask once too.
+On first start the bar asks for permissions (read state, change state, run commands, open panes for the panel under the bar): click it and press `y`. Zellij remembers this per plugin path; bars that were already open in other tabs ask once too.
 
 The layout is generated from zellij's own default layout and swap layouts, with the bar added under the tab bar. It points at this checkout, so `./build.sh` updates new sessions directly. Existing sessions keep their layout; start a new session (or `zellij action new-tab --layout agents`) to get the bar.
 
@@ -60,7 +60,7 @@ The layout is generated from zellij's own default layout and swap layouts, with 
 | key | action |
 |---|---|
 | `Ctrl+Alt+1` … `Ctrl+Alt+9` | jump to agent n of the bar |
-| `Ctrl+Alt+0` | next agent waiting on you (then the next idle one) |
+| `Ctrl+Alt+0` | toggle the agents panel (same as clicking the bar's header) |
 | `Ctrl+Alt+←` / `Ctrl+Alt+→` | previous / next agent from the focused one, wrapping around at both ends |
 
 Each key broadcasts a message to all plugins:
@@ -69,7 +69,7 @@ Each key broadcasts a message to all plugins:
 bind "Ctrl Alt 1" { MessagePlugin { name "zam_jump"; payload "1"; }; }
 ```
 
-Only the bar in the tab you are looking at acts on it, so one press is one jump. Payloads: `1`–`9`, `left`, `right`, and `next` (next agent waiting on you, then the next idle one). Numbers follow the bar order: agents in this session by tab, top-to-bottom and left-to-right within a tab, then agents in other sessions.
+Only the bar in the tab you are looking at acts on it, so one press is one jump. Payloads: `1`–`9`, `left`, `right`, `panel` (toggle the agents panel), and `next` (next agent waiting on you, then the next idle one; no default key, bind it yourself if you want one). Numbers follow the bar order: agents in this session by tab, top-to-bottom and left-to-right within a tab, then agents in other sessions.
 
 `Ctrl+Alt+<digit>` needs a terminal that speaks the kitty keyboard protocol (WezTerm: `config.enable_kitty_keyboard = true`; kitty, foot, ghostty and recent Alacritty do by default). Legacy terminal encoding can't express Ctrl with a digit.
 
@@ -98,9 +98,9 @@ Panel as a floating window in the current session:
 zellij plugin --floating --configuration "mode=panel,scanner=$PWD/scripts/zam-scan.py" -- "file:$PWD/dist/zellij-agents.wasm"
 ```
 
-Zellij asks for permissions on first load (read state, change state, run commands); press `y`.
+Zellij asks for permissions on first load (read state, change state, run commands, open panes for the panel under the bar); press `y`.
 
-Keybinding for the panel (add to the `shared_except "locked"` block of `config.kdl`):
+Clicking the bar's header (or `Ctrl+Alt+0`) toggles the panel without any setup: the bar opens its own pinned floating panel right below itself, full width and sized to the agents, with the bar's config and `mode=panel`. Other floating windows of the tab are tucked away while it is open and come back when it closes. A keybinding of your own for the panel still works on its own (add to the `shared_except "locked"` block of `config.kdl`):
 
 ```kdl
 bind "Alt a" {
@@ -120,5 +120,5 @@ bind "Alt a" {
 | `mode` | `bar` | `bar` or `panel` |
 | `scanner` | `zam-scan.py` | absolute path, or `~/…` |
 | `interval` | `2` | seconds between scans |
-| `hide_on_jump` | `true` | panel hides itself after jumping |
+| `hide_on_jump` | `true` | panel closes itself after jumping |
 | `debug_dump` | – | write each rendered frame to this path |
