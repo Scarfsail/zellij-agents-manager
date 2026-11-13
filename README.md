@@ -33,6 +33,10 @@ Cursor CLI (`cursor-agent`) writes no live session file, so the scanner finds it
 
 Both write `~/.cache/zellij-agents/cursor/<agent pid>.json`; the hook/status line process finds its agent by walking up its parent processes. Cursor has no permission-prompt hook, so a Cursor agent never shows **NEEDS YOU**.
 
+## Notifications
+
+The bar also raises a system notification when an agent enters **NEEDS YOU** (`Claude needs you`, which needs the hooks from `scripts/install-hooks.sh`) or finishes its turn (busy or NEEDS YOU → idle, `Claude finished` / `Cursor finished`), naming repo@branch and the task. The scanner detects the transition and records it in `~/.cache/zellij-agents/notify/`, so bars in several tabs and sessions notify once, and agents that were already waiting or idle when the bars started don't notify at all. Under WSL it shows a Windows toast via `powershell.exe`, skipped while the terminal is the foreground window (recognised: WezTerm via `TERM_PROGRAM`, Windows Terminal via `WT_SESSION`; any other terminal always notifies). The terminal is read from the environment the Zellij server was started in, so a session attached later from a different terminal, or started detached, isn't suppressed correctly. On Linux it runs `notify-send`, which always notifies, since there is no portable way to tell whether the terminal is focused. Set `notify false` in the bar's plugin config to turn it off.
+
 ## Build
 
 ```sh
@@ -116,4 +120,5 @@ bind "Alt a" { MessagePlugin { name "zam_jump"; payload "panel"; }; }
 | `scanner` | `zam-scan.py` | absolute path, or `~/…` |
 | `interval` | `2` | seconds between scans |
 | `hide_on_jump` | `true` | panel closes itself after jumping |
+| `notify` | `true` | bar: system notification when an agent needs you or finishes (see *Notifications*) |
 | `debug_dump` | – | write each rendered frame to this path |

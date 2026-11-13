@@ -22,6 +22,7 @@ import glob
 import json
 import os
 import re
+import shutil
 import socket
 import sqlite3
 import stat
@@ -35,6 +36,8 @@ CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(HOME, ".claude"))
 HOOK_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.join(HOME, ".cache")), "zellij-agents", "claude")
 # "read" marks for questions: <session_id> holds the status_since of the question the user has looked at
 SEEN_DIR = os.path.join(os.path.dirname(HOOK_DIR), "seen")
+# last status seen per agent id, plus <id>@<status>@<since> claims so only one bar notifies per transition
+NOTIFY_DIR = os.path.join(os.path.dirname(HOOK_DIR), "notify")
 CURSOR_DIR = os.path.join(os.path.dirname(HOOK_DIR), "cursor")
 CURSOR_CHATS = os.path.join(HOME, ".cursor", "chats")
 USAGE_DIR = os.path.join(os.path.dirname(HOOK_DIR), "usage")
@@ -45,6 +48,18 @@ FETCH_WAIT_S = 30
 TAIL_BYTES = 256 * 1024
 # Without hooks, a Cursor agent counts as busy while its chat db was written within this many seconds
 CURSOR_BUSY_WINDOW_S = 4
+# Windows toast for WSL; skipped while the terminal (ZAM_TERM) is the foreground app.
+# Text comes in via env and goes through CreateTextNode, so it is never parsed as script or XML.
+# One statement per line: -Command - reads stdin line by line.
+TOAST_PS = r"""
+Add-Type -Name W -Namespace U -MemberDefinition '[DllImport("user32.dll")] public static extern System.IntPtr GetForegroundWindow(); [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(System.IntPtr h, out uint p);'
+$fp = 0; [void][U.W]::GetWindowThreadProcessId([U.W]::GetForegroundWindow(), [ref]$fp)
+if ($env:ZAM_TERM -and (Get-Process -Id $fp -ErrorAction SilentlyContinue).ProcessName -eq $env:ZAM_TERM) { exit }
+$m = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+$x = $m::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+$t = $x.GetElementsByTagName('text'); [void]$t.Item(0).AppendChild($x.CreateTextNode($env:ZAM_TITLE)); [void]$t.Item(1).AppendChild($x.CreateTextNode($env:ZAM_BODY))
+$m::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe').Show([Windows.UI.Notifications.ToastNotification]::new($x))
+"""
 
 
 def seen_ts(sid):
@@ -55,8 +70,13 @@ def seen_ts(sid):
         return 0
 
 
+def safe_id(sid):
+    """usable as a file name in our cache dirs"""
+    return bool(sid) and "/" not in sid and not sid.startswith(".")
+
+
 def mark_seen(sid, ts):
-    if not sid or "/" in sid or sid.startswith("."):
+    if not safe_id(sid):
         return
     os.makedirs(SEEN_DIR, exist_ok=True)
     tmp = os.path.join(SEEN_DIR, f".{sid}.tmp")
@@ -481,7 +501,7 @@ def claude_statusline(chain):
     try:
         p = json.loads(data)
         sid = p.get("session_id") or ""
-        if sid and "/" not in sid and not sid.startswith("."):
+        if safe_id(sid):
             cost = (p.get("cost") or {}).get("total_cost_usd")
             write_json(os.path.join(HOOK_DIR, f"{sid}.status.json"), {"cost_usd": cost, "ts": int(time.time() * 1000)})
     except Exception:
@@ -554,6 +574,7 @@ def cursor_agents():
             cwd = meta.get("cwd") or ""
             st = cursor_state(pid)
             detail = ""
+            hooked = st.get("event") == "stop" or st.get("event") in CURSOR_BUSY
             if st.get("event") == "stop":
                 status, status_ts = "idle", st.get("since", st.get("ts", 0))
             elif st.get("event") in CURSOR_BUSY:
@@ -574,6 +595,7 @@ def cursor_agents():
                 "status_since": status_ts,
                 "seen": False,
                 "detail": detail,
+                "hooked": hooked,  # status from hooks, not guessed from db writes: only then notify
                 **pane_fields(pid, env),
                 "model": st.get("model") or m.get("lastUsedModel"),
                 # empty: the plugin falls back to the pane title
@@ -727,6 +749,129 @@ def claude_usage():
         return None
 
 
+def notification_text(a):
+    kind = (a.get("kind") or "agent").capitalize()
+    asks = a.get("status") == "needs_input"
+    where = "@".join(p for p in (a.get("name"), a.get("branch")) if p)
+    body = " · ".join(p for p in (where, a.get("title"), asks and a.get("detail")) if p)
+    return f"{kind} needs you" if asks else f"{kind} finished", body
+
+
+def send_notification(title, body):
+    """start the notifier detached and don't wait: PowerShell takes ~2s and a scan must stay fast"""
+    env = dict(os.environ, ZAM_TITLE=title, ZAM_BODY=body)
+    script = None
+    wsl = os.environ.get("WSL_DISTRO_NAME") or os.path.exists("/proc/sys/fs/binfmt_misc/WSLInterop")
+    if wsl and shutil.which("powershell.exe"):
+        # the Zellij server's env, inherited from the terminal it was started in
+        if os.environ.get("TERM_PROGRAM") == "WezTerm":
+            env["ZAM_TERM"] = "wezterm-gui"
+        elif os.environ.get("WT_SESSION"):
+            env["ZAM_TERM"] = "WindowsTerminal"
+        else:
+            env["ZAM_TERM"] = ""  # unknown terminal: always notify
+        env["WSLENV"] = ":".join(filter(None, (os.environ.get("WSLENV"), "ZAM_TITLE/w:ZAM_BODY/w:ZAM_TERM/w")))
+        cmd, script = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "-"], TOAST_PS
+    elif shutil.which("notify-send"):
+        cmd = ["notify-send", "-a", "zellij-agents", title, body]
+    else:
+        return
+    try:
+        p = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE if script else subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            start_new_session=True,
+        )
+        if script:
+            with p.stdin:
+                p.stdin.write(script.encode())  # far below the pipe buffer, so this never blocks
+    except OSError:
+        pass  # a failed notification must not break the scan
+
+
+def _int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def notify_transitions(agents):
+    """notify when an agent starts waiting or finishes its turn, once across all bars"""
+    try:
+        os.makedirs(NOTIFY_DIR, exist_ok=True)
+        files = os.listdir(NOTIFY_DIR)
+    except OSError:
+        return
+    live, stale = set(), set()
+    for a in agents:
+        aid, status = str(a.get("id") or ""), a.get("status")
+        if not safe_id(aid):
+            continue
+        live.add(aid)
+        since = _int(a.get("status_since"))
+        cur = f"{status} {a.get('status_since')}"
+        path = os.path.join(NOTIFY_DIR, aid)
+        try:
+            with open(path) as f:
+                prev = f.read()
+        except OSError:
+            prev = None  # first sight (bar start, agent already waiting): only record
+        if prev == cur:
+            continue
+        prev_status, _, prev_since = (prev or "").partition(" ")
+        prev_since = _int(prev_since)
+        if since is not None and prev_since is not None and since < prev_since:
+            continue  # this bar's snapshot is older than the recorded state: never move it backwards
+        fire = (
+            prev is not None
+            and (a.get("kind") != "cursor" or a.get("hooked"))
+            and (
+                (status == "needs_input" and prev_status != "needs_input")
+                or (status == "idle" and prev_status in ("busy", "needs_input"))
+            )
+        )
+        claim = f"{aid}@{status}@{a.get('status_since')}"
+        try:
+            if fire:
+                try:
+                    os.close(os.open(os.path.join(NOTIFY_DIR, claim), os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+                    send_notification(*notification_text(a))
+                except FileExistsError:
+                    pass  # another bar got there first
+            tmp = os.path.join(NOTIFY_DIR, f".{aid}.{os.getpid()}.tmp")
+            with open(tmp, "w") as f:
+                f.write(cur)
+            os.replace(tmp, path)
+        except OSError:
+            continue
+        # claims of this agent's older transitions
+        for n in files:
+            parts = n.rsplit("@", 2)
+            if len(parts) == 3 and parts[0] == aid and since is not None:
+                cs = _int(parts[2])
+                if cs is not None and cs < since:
+                    stale.add(n)
+    # files of agents not seen for a day, and tmp files left by a killed scan; a single missed scan drops nothing
+    for n in files:
+        if n.startswith("."):
+            gone = True
+        else:
+            gone = n not in live and n.rsplit("@", 2)[0] not in live
+        if gone:
+            age = _age_s(os.path.join(NOTIFY_DIR, n))
+            if age is not None and age > 86400:
+                stale.add(n)
+    for n in stale:
+        try:
+            os.remove(os.path.join(NOTIFY_DIR, n))
+        except OSError:
+            pass  # another bar removed it
+
+
 def main():
     if len(sys.argv) >= 4 and sys.argv[1] == "--seen":
         mark_seen(sys.argv[2], sys.argv[3])
@@ -742,6 +887,11 @@ def main():
         return fetch_usage()
     agents = claude_agents() + cursor_agents()
     agents.sort(key=lambda a: a.get("started_at", 0))
+    if "--notify" in sys.argv:
+        try:
+            notify_transitions(agents)
+        except Exception:
+            pass  # notifications must never cost the bar its output
     usage = claude_usage()
     out = {
         "now": int(time.time() * 1000),
