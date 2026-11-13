@@ -167,6 +167,7 @@ impl ZellijPlugin for State {
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
             PermissionType::RunCommands,
+            PermissionType::OpenTerminalsOrPlugins,
         ]);
         subscribe(&[
             EventType::PermissionRequestResult,
