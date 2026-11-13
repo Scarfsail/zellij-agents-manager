@@ -812,6 +812,13 @@ fn trunc(s: &str, w: usize) -> String {
     t
 }
 
+/// Widest first: the largest cap c ≥ `floor` at which Σ max(lo, min(nat, c)) ≤ `budget`, over (lo, nat) items
+/// (`lo` never shrinks, `nat` is the natural width). The widest natural width when all fit; None if `floor` doesn't.
+fn shared_cap(items: &[(usize, usize)], budget: usize, floor: usize) -> Option<usize> {
+    let top = items.iter().map(|&(_, nat)| nat).max().unwrap_or(0);
+    (floor.min(top)..=top).rev().find(|&c| items.iter().map(|&(lo, nat)| lo.max(nat.min(c))).sum::<usize>() <= budget)
+}
+
 fn short_model(m: &Option<String>) -> String {
     let m = m.as_deref().unwrap_or("");
     m.trim_start_matches("claude-").to_string()
@@ -873,7 +880,8 @@ impl State {
 
     /// Two-row bar. Row 0: purpose. Row 1: status icon, number, location, ctx. Chips split by │.
     fn render_bar(&mut self, cols: usize) -> String {
-        const CHIP_MAX: usize = 36;
+        // chips shrink (widest first) down to this; below it, trailing chips hide behind "+N"
+        const CHIP_MIN: usize = 16;
         let (needs, busy, idle, total) = self.counts();
         let mut l0 = String::new();
         let mut l1 = String::new();
@@ -894,18 +902,34 @@ impl State {
             l1.push_str(&format!("{DIM}│{RESET} {RED}{e}{RESET} "));
             x += w + 3;
         }
-        for i in 0..self.rows.len() {
+        // every chip's number, ctx, location and purpose
+        let chips: Vec<(String, String, String, String)> = self
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let ctx = self.ctx_label(&r.agent).map(|c| format!(" {c}")).unwrap_or_default();
+                // the number is the Alt+Shift+<n> jump key; ↗ = agent lives in another zellij session
+                let remote = if !r.local && r.agent.zellij_session.is_some() { "↗" } else { "" };
+                (format!(" {}{remote} ", i + 1), ctx, self.location(r), self.purpose(r))
+            })
+            .collect();
+        // one width cap for every chip: full content when it fits, else the widest are cut; each chip costs "│", " ", " "
+        let items: Vec<(usize, usize)> = chips
+            .iter()
+            .zip(&self.rows)
+            .map(|((num, ctx, loc, purpose), r)| {
+                let lo = dw(status_style(&r.agent.status, self.frame).0) + dw(num) + dw(ctx);
+                (lo, (lo + dw(loc)).max(dw(purpose)))
+            })
+            .collect();
+        let cap = shared_cap(&items, cols.saturating_sub(x + 3 * self.rows.len()), CHIP_MIN).unwrap_or(CHIP_MIN);
+        for (i, (num, ctx, loc, purpose)) in chips.iter().enumerate() {
             let r = &self.rows[i];
             let (icon, _, color) = status_style(&r.agent.status, self.frame);
-            let ctx = self.ctx_label(&r.agent).map(|c| format!(" {c}")).unwrap_or_default();
-            // the number is the Alt+Shift+<n> jump key; ↗ = agent lives in another zellij session
-            let remote = if !r.local && r.agent.zellij_session.is_some() { "↗" } else { "" };
-            let num = format!(" {}{remote} ", i + 1);
-            let loc_w = CHIP_MAX.saturating_sub(dw(icon) + dw(&num) + dw(&ctx));
-            let loc = trunc(&self.location(r), loc_w).trim_end().to_string();
+            let loc = trunc(loc, cap.saturating_sub(items[i].0)).trim_end().to_string();
             let status = format!("{icon}{num}{loc}{ctx}");
-            let purpose = self.purpose(r);
-            let w = dw(&status).max(dw(&purpose).min(CHIP_MAX));
+            let w = dw(&status).max(dw(purpose).min(cap));
             let remaining = self.rows.len() - i;
             let more = if remaining > 1 { dw(&format!(" +{}", remaining - 1)) } else { 0 };
             if x + 3 + w + more > cols {
@@ -941,7 +965,7 @@ impl State {
             let pad = " ".repeat(w - dw(&status));
             // blink "off": the "?" disappears, the number stays
             let icon = if icon_hidden { " " } else { icon };
-            l0.push_str(&format!("{pre}{} {post}", trunc(&purpose, w)));
+            l0.push_str(&format!("{pre}{} {post}", trunc(purpose, w)));
             l1.push_str(&format!(
                 "{pre}{color}{icon}{RESET}{pre}{soft}{num}{repo}{RESET}{pre}{branch_col}{branch}{RESET}{pre}{ctx_col}{ctx}{RESET}{pre}{pad} {post}"
             ));
@@ -1020,7 +1044,7 @@ impl State {
         const TASK: usize = 5;
         const MODEL: usize = 6;
         const CTX: usize = 7;
-        const CAP: [usize; 9] = [usize::MAX, usize::MAX, usize::MAX, 12, 28, usize::MAX, 12, usize::MAX, usize::MAX];
+        const CAP: [usize; 9] = [usize::MAX, usize::MAX, usize::MAX, 12, usize::MAX, usize::MAX, 12, usize::MAX, usize::MAX];
         // below this, TASK is dropped rather than squeezed
         const TASK_MIN: usize = 10;
         // WHERE, TAB and MODEL narrow down to this before the line is cut
@@ -1085,15 +1109,19 @@ impl State {
                 (cells, color, ctx_col, m.map(|(lit, _)| lit.chars().count()))
             })
             .collect();
-        // one set of widths for the header and every row: widest cell, capped; TASK at most what is left
+        // one set of widths for the header and every row: widest cell, capped; WHERE and TASK share what is left
         let mut w: Vec<usize> = (0..HEAD.len())
             .map(|c| table.iter().map(|t| dw(&t.0[c])).chain([dw(HEAD[c])]).max().unwrap_or(0).min(CAP[c]))
             .collect();
         let gaps = 2 * (HEAD.len() - 1);
-        let rest = cols.saturating_sub(w.iter().sum::<usize>() - w[TASK] + gaps);
-        // TASK shows when its widest cell fits, or at least TASK_MIN cells do
-        let task = rest >= TASK_MIN.min(w[TASK]);
-        w[TASK] = w[TASK].min(rest);
+        let budget = cols.saturating_sub(w.iter().sum::<usize>() - w[WHERE] - w[TASK] + gaps);
+        // the wider of WHERE and TASK is cut first; TASK shows when both fit with it at least TASK_MIN cells
+        let cap = shared_cap(&[(0, w[WHERE]), (0, w[TASK])], budget, TASK_MIN.min(w[TASK]).max(FLEX_MIN));
+        let task = cap.is_some();
+        if let Some(c) = cap {
+            w[WHERE] = w[WHERE].min(c);
+            w[TASK] = w[TASK].min(c);
+        }
         // no TASK and still too wide: narrow WHERE, then TAB, then MODEL, so CTX and COST are not cut off the right
         if !task {
             let mut over = (w.iter().sum::<usize>() - w[TASK] + gaps - 2).saturating_sub(cols);
@@ -1306,6 +1334,39 @@ mod tests {
             let lines: Vec<String> = s.render_bar(cols).split('\n').map(strip).collect();
             assert!(lines[1].contains(" +") && dw(&lines[0]) <= cols && dw(&lines[1]) <= cols, "cols {cols}: {lines:?}");
         }
+
+        // room to spare: a title and repo@branch longer than 36 cells both show in full
+        let long = |title: &str| Agent { status: "idle".into(), cwd: Some("/x/eng-intelligence".into()), branch: Some("feat/168-long-branch-name".into()), ctx_pct: Some(40.0), title: title.into(), ..Default::default() };
+        let title = "refactor the scanner so sessions survive restarts";
+        s.rows = vec![row(long(title), false, false)];
+        let lines: Vec<String> = s.render_bar(200).split('\n').map(strip).collect();
+        assert!(lines[0].contains(title) && lines[1].contains("eng-intelligence@feat/168-long-branch-name 40%"), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains('…')), "{lines:?}");
+
+        // short of room: only the long chip is cut, the short one stays whole, and no "+N"
+        s.rows = vec![row(long(title), false, false), row(agent("idle", "fix"), false, false)];
+        let cols = 80;
+        let lines: Vec<String> = s.render_bar(cols).split('\n').map(strip).collect();
+        assert!(lines[0].contains("refactor the scanner") && lines[0].contains('…') && lines[1].contains("eng-intelligence@"), "{lines:?}");
+        assert!(lines[0].contains(" fix ") && lines[1].contains(" 2 svc@main 90%") && !lines[1].contains(" +"), "{lines:?}");
+        assert!(dw(&lines[0]) == dw(&lines[1]) && dw(&lines[0]) <= cols, "{lines:?}");
+    }
+
+    #[test]
+    fn shared_cap_cuts_widest_first() {
+        // everything fits: the widest natural width
+        assert_eq!(shared_cap(&[(0, 10), (0, 30)], 40, 5), Some(30));
+        // only the widest is cut; the short item keeps its 10
+        assert_eq!(shared_cap(&[(0, 10), (0, 30)], 30, 5), Some(20));
+        // two wide items share one cap; `lo` never shrinks
+        assert_eq!(shared_cap(&[(0, 10), (0, 30), (0, 40)], 40, 5), Some(15));
+        assert_eq!(shared_cap(&[(12, 14), (0, 30)], 20, 5), Some(8));
+        // below the floor: None
+        assert_eq!(shared_cap(&[(0, 10), (0, 30)], 14, 8), None);
+        assert_eq!(shared_cap(&[(0, 10), (0, 30)], 16, 8), Some(8));
+        // the floor is FLEX_MIN even when TASK is only 4 cells: 42-cell WHERE is not cut to 5 for it
+        assert_eq!(shared_cap(&[(0, 42), (0, 4)], 9, 4.max(8)), None);
+        assert_eq!(shared_cap(&[(0, 5), (0, 4)], 9, 4.max(8)), Some(5));
     }
 
     #[test]
@@ -1381,6 +1442,26 @@ mod tests {
             assert!(first.contains("$12.34") && first.contains("78%"), "{cols}: {first:?}");
             assert!(lines.iter().all(|l| dw(l) == cols), "{cols}: {lines:?}");
         }
+        // room to spare: a WHERE over 28 cells and a long TASK both show in full
+        s.rows[0].agent.title = "refactor the scanner so sessions survive restarts".into();
+        let lines: Vec<String> = s.render_panel(20, 200).split('\n').map(strip).collect();
+        let first = &lines[State::panel_header_lines(1)];
+        assert!(first.contains("eng-intelligence@feat/168-long-branch-name") && first.contains("survive restarts"), "{first:?}");
+        // short of room: the shorter of WHERE and TASK stays whole, the longer is cut
+        let lines: Vec<String> = s.render_panel(20, 157).split('\n').map(strip).collect();
+        let first = &lines[State::panel_header_lines(1)];
+        assert!(first.contains("eng-intelligence@feat/168-long-branch-name") && first.contains("refactor the scanner") && first.contains('…'), "{first:?}");
+        assert!(!first.contains("survive restarts") && lines.iter().all(|l| dw(l) == 157), "{lines:?}");
+        s.rows[0].agent.title = "fix login".into();
+        // every TASK shorter than FLEX_MIN: TASK is dropped rather than WHERE cut below FLEX_MIN, lines stay `cols` wide
+        for r in &mut s.rows {
+            r.agent.title = "fix".into();
+        }
+        for cols in 60..=100 {
+            let lines: Vec<String> = s.render_panel(20, cols).split('\n').map(strip).collect();
+            assert!(lines.iter().all(|l| dw(l) == cols), "{cols}: {lines:?}");
+        }
+        s.rows[0].agent.title = "fix login".into();
         // a short TASK leaves the spare width at the end, not between TASK and MODEL
         let out = s.render_panel(20, 200);
         let head = strip(out.split('\n').nth(State::panel_header_lines(1) - 1).unwrap());
