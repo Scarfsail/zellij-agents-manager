@@ -102,17 +102,10 @@ zellij plugin --floating --configuration "mode=panel,scanner=$PWD/scripts/zam-sc
 
 Zellij asks for permissions on first load (read state, change state, run commands, open panes for the panel under the bar); press `y`.
 
-Clicking the bar's header (or `Ctrl+Alt+0`) toggles the panel without any setup: the bar opens its own pinned floating panel right below itself, full width and sized to the agents, with the bar's config and `mode=panel`. Other floating windows of the tab are tucked away while it is open and come back when it closes. A keybinding of your own for the panel still works on its own (add to the `shared_except "locked"` block of `config.kdl`):
+Clicking the bar's header (or `Ctrl+Alt+0`) toggles the panel without any setup: the bar opens its own pinned floating panel right below itself, full width and sized to the agents, with the bar's config and `mode=panel`. Other floating windows of the tab are tucked away while it is open and come back when it closes. The panel starts with the selection on the agent you were focused on, which only the bar knows, so a keybinding of your own for the panel should go through the bar with the `panel` payload (add to the `shared_except "locked"` block of `config.kdl`):
 
 ```kdl
-bind "Alt a" {
-    LaunchOrFocusPlugin "file:~/dev/zellij-agents-manager/dist/zellij-agents.wasm" {   // your checkout path; ~ works
-        floating true
-        move_to_focused_tab true
-        mode "panel"
-        scanner "~/dev/zellij-agents-manager/scripts/zam-scan.py"
-    }
-}
+bind "Alt a" { MessagePlugin { name "zam_jump"; payload "panel"; }; }
 ```
 
 ## Config

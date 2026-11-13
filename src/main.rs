@@ -133,6 +133,10 @@ struct State {
     hidden: bool,
     /// terminal panes the attached clients are focused on (authoritative; PaneInfo.is_focused goes stale)
     client_focus: Vec<u32>,
+    /// client_focus came from a live ListClients report (not handed over or kept while on the panel): only then mark questions read
+    focus_live: bool,
+    /// Panel: start the selection on the focused agent once a row is focused, unless the user moved it first
+    select_focused: bool,
     /// running zellij sessions (SessionUpdate); None until the first update arrives
     live_sessions: Option<Vec<String>>,
     /// SGR for the focused chip, from zellij's theme (ribbon_selected = the active tab's colours)
@@ -172,6 +176,8 @@ impl Default for State {
             since_poll: 0.0,
             hidden: false,
             client_focus: Vec::new(),
+            focus_live: false,
+            select_focused: false,
             live_sessions: None,
             active_style: None,
             seen_local: Default::default(),
@@ -186,6 +192,9 @@ impl ZellijPlugin for State {
     fn load(&mut self, cfg: BTreeMap<String, String>) {
         if cfg.get("mode").map(|m| m == "panel").unwrap_or(false) {
             self.mode = Mode::Panel;
+            // while the panel is open the client is focused on it, so the bar hands over what was focused before
+            self.client_focus = cfg.get("focus").into_iter().flat_map(|f| f.split(',')).filter_map(|id| id.parse().ok()).collect();
+            self.select_focused = true;
         }
         if let Some(s) = cfg.get("scanner") {
             self.scanner = s.clone();
@@ -304,7 +313,12 @@ impl ZellijPlugin for State {
                         _ => None,
                     })
                     .collect();
-                let changed = focus != self.client_focus;
+                // a client on the panel reports no terminal: the panel keeps the focus the bar handed over, the bar keeps its own;
+                // kept focus is for display only, so it never marks questions read
+                let on_panel = self.panel.as_ref().is_some_and(|p| clients.iter().any(|c| c.pane_id == PaneId::Plugin(p.id)));
+                let keep = focus.is_empty() && (self.mode == Mode::Panel || on_panel);
+                let changed = !keep && (focus != self.client_focus || !self.focus_live);
+                self.focus_live = !keep;
                 if changed {
                     self.client_focus = focus;
                     self.rebuild();
@@ -499,6 +513,7 @@ impl State {
         let height = (Self::panel_header_lines(self.usage_lines().len()) + self.rows.len() + 2).min(ti.viewport_rows / 2).max(6);
         let mut cfg = self.cfg.clone();
         cfg.insert("mode".into(), "panel".into());
+        cfg.insert("focus".into(), self.client_focus.iter().map(u32::to_string).collect::<Vec<_>>().join(","));
         let coords = FloatingPaneCoordinates::new(
             Some("0".into()),
             Some(y.to_string()),
@@ -629,7 +644,7 @@ impl State {
             )
         });
         // focusing a waiting agent reads its question: shared through the scanner so every tab's bar agrees
-        for r in rows.iter_mut().filter(|r| r.focused && r.agent.status == "needs_input" && !r.seen) {
+        for r in rows.iter_mut().filter(|r| self.focus_live && r.focused && r.agent.status == "needs_input" && !r.seen) {
             r.seen = true;
             if let Some(id) = r.agent.id.clone() {
                 let ts = r.agent.status_since.to_string();
@@ -642,9 +657,16 @@ impl State {
         if self.selected >= self.rows.len() {
             self.selected = self.rows.len().saturating_sub(1);
         }
+        if self.select_focused {
+            if let Some(i) = self.rows.iter().position(|r| r.focused) {
+                self.selected = i;
+                self.select_focused = false;
+            }
+        }
     }
 
     fn move_sel(&mut self, d: isize) -> bool {
+        self.select_focused = false; // the user's choice wins over a late focus match
         if self.rows.is_empty() {
             return false;
         }
@@ -667,6 +689,7 @@ impl State {
     }
 
     fn jump(&mut self, idx: usize) {
+        self.select_focused = false; // click, enter and `n` pick a row too
         let Some(row) = self.rows.get(idx) else { return };
         let Some(pane) = row.agent.pane_id else { return };
         if row.local {
@@ -706,6 +729,8 @@ const RESET: &str = "\x1b[0m";
 const DIM: &str = "\x1b[2m";
 const BOLD: &str = "\x1b[1m";
 const REV: &str = "\x1b[7m";
+/// dark grey background: the bar's unfocused chips and the panel's selected row
+const GREY_BG: &str = "\x1b[48;5;236m";
 
 /// SGR parameters for a theme colour; `layer` is 38 (fg) or 48 (bg).
 fn sgr(c: PaletteColor, layer: u8) -> String {
@@ -880,7 +905,7 @@ impl State {
             // focused chip = zellij's active-tab colours; its padding spaces carry the background too
             let active = self.active_style.as_deref().unwrap_or(REV);
             // inactive chips: dark grey, so each chip reads as a tab
-            let (pre, post) = if r.focused { (active, RESET) } else { ("\x1b[48;5;236m", RESET) };
+            let (pre, post) = if r.focused { (active, RESET) } else { (GREY_BG, RESET) };
             // waiting for you: the whole chip pulses amber (0.6s on, 0.6s off), driven by the spinner clock
             let waiting = r.agent.status == "needs_input";
             let on = (self.frame / 2) % 2 == 0;
@@ -1001,18 +1026,11 @@ impl State {
             .map(|(i, r)| {
                 let a = &r.agent;
                 let (icon, label, color) = status_style(&a.status, self.frame);
-                let sel = i == self.selected;
-                // selected row = zellij's active-tab colours, same rules as the bar's focused chip
-                let ctx_col = match self.ctx_pct(a).map_or("", |p| pct_color(p as f64)) {
-                    YELLOW if sel => "",
-                    c => c,
-                };
+                let ctx_col = self.ctx_pct(a).map_or("", |p| pct_color(p as f64));
                 let waiting = a.status == "needs_input";
                 // unread question: the status cell pulses; read: it stays amber, only the "?" blinks
                 let color = if waiting && !r.seen && on {
                     WAIT_BG
-                } else if sel && !waiting {
-                    BOLD
                 } else {
                     color
                 };
@@ -1051,11 +1069,12 @@ impl State {
         let hdr = Self::panel_header_lines(usage.len());
         let body = rows.saturating_sub(hdr);
         let start = if self.selected >= body { self.selected + 1 - body } else { 0 };
+        // focused agent = zellij's active-tab colours on its "▶n" cell, like the bar's focused chip; selected row = grey
         let active = self.active_style.as_deref().unwrap_or(REV);
         for (i, (cells, color, ctx_col)) in table.iter().enumerate().skip(start).take(body) {
             let mut styles = [""; 9];
-            (styles[1], styles[7]) = (color, ctx_col);
-            lines.push(line(if i == self.selected { active } else { "" }, cells, &styles));
+            (styles[0], styles[1], styles[7]) = (if self.rows[i].focused { active } else { "" }, color, ctx_col);
+            lines.push(line(if i == self.selected { GREY_BG } else { "" }, cells, &styles));
             self.hits.push((hdr + i - start, 0, cols, i));
         }
         if self.rows.is_empty() {
