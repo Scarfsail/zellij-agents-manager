@@ -9,6 +9,40 @@ use zellij_tile::prelude::*;
 struct Scan {
     now: i64,
     agents: Vec<Agent>,
+    /// account usage per vendor ("claude"), from the scanner's cache of the vendor's usage endpoint
+    #[serde(default)]
+    usage: BTreeMap<String, VendorUsage>,
+}
+
+#[derive(Deserialize, Clone, Default)]
+#[serde(default)]
+struct VendorUsage {
+    credits: Option<Credits>,
+    five_hour: Option<Window>,
+    seven_day: Option<Window>,
+    error: Option<String>,
+}
+
+/// usage-based spend this month (enterprise)
+#[derive(Deserialize, Clone, Default)]
+#[serde(default)]
+struct Credits {
+    used: f64,
+    limit: f64,
+    pct: Option<f64>,
+    currency: Option<String>,
+    resets_at: i64,
+    /// local time zone offset at `resets_at`: the plugin has none of its own
+    utc_offset_s: i64,
+}
+
+/// a subscription's rolling limit (5h, week)
+#[derive(Deserialize, Clone, Default)]
+#[serde(default)]
+struct Window {
+    pct: Option<f64>,
+    resets_at: i64,
+    utc_offset_s: i64,
 }
 
 #[derive(Deserialize, Clone, Default)]
@@ -30,6 +64,8 @@ struct Agent {
     title: String,
     branch: Option<String>,
     model: Option<String>,
+    /// session cost so far, from Claude's status line
+    cost_usd: Option<f64>,
     /// the current question was already looked at (scanner's shared "read" mark)
     seen: bool,
 }
@@ -460,7 +496,7 @@ impl State {
         };
         let Some(ti) = self.my_tab_info() else { return };
         let layer_hidden = !ti.are_floating_panes_visible;
-        let height = (3 + self.rows.len() + 2).min(ti.viewport_rows / 2).max(6);
+        let height = (Self::panel_header_lines(self.usage_lines().len()) + self.rows.len() + 2).min(ti.viewport_rows / 2).max(6);
         let mut cfg = self.cfg.clone();
         cfg.insert("mode".into(), "panel".into());
         let coords = FloatingPaneCoordinates::new(
@@ -790,9 +826,10 @@ impl State {
         r.agent.name.clone()
     }
 
+    /// The tab's name; `↗session` for an agent in another zellij session.
     fn tab_tag(&self, r: &Row) -> String {
         match (r.tab_pos, &r.agent.zellij_session) {
-            (Some(p), _) => format!("{}", p + 1),
+            (Some(p), _) => self.tabs.iter().find(|t| t.position == p).map_or_else(|| format!("{}", p + 1), |t| t.name.clone()),
             (None, Some(s)) if !r.local => format!("↗{s}"),
             _ => "?".into(),
         }
@@ -876,77 +913,195 @@ impl State {
         format!("{l0}\n{l1}")
     }
 
+    /// One line per vendor with usage data: credits spent / limit, and/or the 5h and weekly limits.
+    fn usage_lines(&self) -> Vec<Vec<(&'static str, String)>> {
+        let now = self.scan.now;
+        let mut lines = vec![];
+        for (vendor, u) in &self.scan.usage {
+            let name: String = vendor.chars().take(1).flat_map(char::to_uppercase).chain(vendor.chars().skip(1)).collect();
+            let mut parts: Vec<(&'static str, String)> = vec![];
+            if let Some(e) = &u.error {
+                parts.push((DIM, format!("  usage n/a ({e})")));
+            } else {
+                if let Some(c) = &u.credits {
+                    let cur = match c.currency.as_deref().unwrap_or("USD") {
+                        "USD" => "$".to_string(),
+                        other => format!("{other} "),
+                    };
+                    parts.push(("", format!("  credits {cur}{:.2} / {cur}{:.2}", c.used, c.limit)));
+                    if let Some(p) = c.pct {
+                        parts.push(("", " · ".into()));
+                        parts.push((pct_color(p), format!("{p:.0}%")));
+                    }
+                    if c.resets_at > 0 {
+                        let (m, d, _) = local_date(c.resets_at, c.utc_offset_s);
+                        parts.push(("", format!(" · resets {} {d}", MONTHS[m - 1])));
+                    }
+                }
+                for (label, w) in [("5h", &u.five_hour), ("week", &u.seven_day)] {
+                    let Some(w) = w else { continue };
+                    let gap = if parts.is_empty() { "  " } else { "   " };
+                    parts.push(("", format!("{gap}{label}")));
+                    if let Some(p) = w.pct {
+                        parts.push((pct_color(p), format!(" {p:.0}%")));
+                    }
+                    if w.resets_at > 0 {
+                        // the 5h window resets within hours: show how soon; the week: on which day
+                        let when = if label == "5h" { ago(w.resets_at, now) } else { WEEKDAYS[local_date(w.resets_at, w.utc_offset_s).2].into() };
+                        parts.push(("", format!(" · resets {when}")));
+                    }
+                }
+            }
+            if !parts.is_empty() {
+                lines.push([vec![(BOLD, format!(" {name}"))], parts].concat());
+            }
+        }
+        lines
+    }
+
+    /// Panel lines above the agent rows: counts, vendor usage lines, help (or error), column header.
+    fn panel_header_lines(vendor_lines: usize) -> usize {
+        3 + vendor_lines
+    }
+
     fn render_panel(&mut self, rows: usize, cols: usize) -> String {
-        use std::fmt::Write;
-        let mut o = String::new();
+        const HEAD: [&str; 9] = ["", "STATUS", "FOR", "TAB", "WHERE", "TASK", "MODEL", "CTX", "COST"];
+        const TASK: usize = 5;
+        const CAP: [usize; 9] = [usize::MAX, usize::MAX, usize::MAX, 12, 28, usize::MAX, 12, usize::MAX, usize::MAX];
+        // below this, TASK is dropped rather than squeezed
+        const TASK_MIN: usize = 10;
+        let mut lines = vec![];
         let (needs, busy, idle, total) = self.counts();
         let now = self.scan.now;
-        let _ = writeln!(o, 
-            "{BOLD} Agents{RESET} {total}  {}{needs} need you{RESET}  \x1b[33m{busy} working{RESET}  \x1b[32m{idle} idle{RESET}",
-            if needs > 0 { WAIT_FG } else { DIM }
-        );
-        if let Some(e) = &self.error {
-            let _ = writeln!(o, "\x1b[31m {}{RESET}", trunc(e, cols.saturating_sub(1)));
-        } else {
-            let _ = writeln!(o, "{DIM} ↑↓/jk select · enter/click jump · n next waiting · q close{RESET}");
-        }
-        // columns: status(11) tab(10) location(34) since(7) ctx(6) model(13) up(7) task(rest)
-        let fixed = 2 + 11 + 10 + 34 + 7 + 6 + 13 + 7;
-        let detail_w = cols.saturating_sub(fixed);
-        let _ = writeln!(o, 
-            "{DIM}    {:<11}{:<10}{:<34}{:<7}{:<6}{:<13}{:<7}{}{RESET}",
-            "STATUS", "TAB", "LOCATION", "SINCE", "CTX", "MODEL", "UP", trunc("TASK", detail_w)
-        );
-        let body = rows.saturating_sub(3);
+        lines.push(fit(
+            "",
+            &[
+                (BOLD, " Agents".into()),
+                ("", format!(" {total}  ")),
+                (if needs > 0 { WAIT_FG } else { DIM }, format!("{needs} need you")),
+                ("", "  ".into()),
+                (YELLOW, format!("{busy} working")),
+                ("", "  ".into()),
+                ("\x1b[32m", format!("{idle} idle")),
+            ],
+            cols,
+        ));
+        let usage = self.usage_lines();
+        lines.extend(usage.iter().map(|l| fit("", l, cols)));
+        lines.push(match &self.error {
+            Some(e) => fit("", &[(RED, format!(" {e}"))], cols),
+            None => fit("", &[(DIM, " ↑↓/jk select · enter/click jump · n next waiting · q close".into())], cols),
+        });
+        // every row's cells and the styles of its status and ctx cells, in column order
+        let on = (self.frame / 2) % 2 == 0;
+        let table: Vec<([String; 9], &str, &str)> = self
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let a = &r.agent;
+                let (icon, label, color) = status_style(&a.status, self.frame);
+                let sel = i == self.selected;
+                // selected row = zellij's active-tab colours, same rules as the bar's focused chip
+                let ctx_col = match self.ctx_pct(a).map_or("", |p| pct_color(p as f64)) {
+                    YELLOW if sel => "",
+                    c => c,
+                };
+                let waiting = a.status == "needs_input";
+                // unread question: the status cell pulses; read: it stays amber, only the "?" blinks
+                let color = if waiting && !r.seen && on {
+                    WAIT_BG
+                } else if sel && !waiting {
+                    BOLD
+                } else {
+                    color
+                };
+                let icon = if waiting && r.seen && !on { " " } else { icon };
+                let task = if a.detail.is_empty() { self.purpose(r) } else { format!("{} · {}", self.purpose(r), a.detail) };
+                let cells = [
+                    format!("{}{}", if r.focused { "▶" } else { " " }, i + 1),
+                    format!("{icon} {label}"),
+                    ago(now, a.status_since),
+                    self.tab_tag(r),
+                    self.location(r),
+                    task,
+                    short_model(&a.model),
+                    self.ctx_label(a).unwrap_or("-".into()),
+                    a.cost_usd.map_or("-".into(), |c| format!("${c:.2}")),
+                ];
+                (cells, color, ctx_col)
+            })
+            .collect();
+        // one set of widths for the header and every row: widest cell, capped; TASK gets what is left
+        let mut w: Vec<usize> = (0..HEAD.len())
+            .map(|c| table.iter().map(|t| dw(&t.0[c])).chain([dw(HEAD[c])]).max().unwrap_or(0).min(CAP[c]))
+            .collect();
+        let rest = cols.saturating_sub(w.iter().sum::<usize>() - w[TASK] + 2 * (HEAD.len() - 1));
+        w[TASK] = rest;
+        let shown: Vec<usize> = (0..HEAD.len()).filter(|&c| c != TASK || rest >= TASK_MIN).collect();
+        let line = |base: &str, cells: &[String], styles: &[&str]| {
+            let pieces: Vec<(&str, String)> = shown
+                .iter()
+                .enumerate()
+                .flat_map(|(k, &c)| [("", if k > 0 { "  " } else { "" }.to_string()), (styles[c], trunc(&cells[c], w[c]))])
+                .collect();
+            fit(base, &pieces, cols)
+        };
+        lines.push(line("", &HEAD.map(String::from), &[DIM; 9]));
+        let hdr = Self::panel_header_lines(usage.len());
+        let body = rows.saturating_sub(hdr);
         let start = if self.selected >= body { self.selected + 1 - body } else { 0 };
-        for (i, r) in self.rows.iter().enumerate().skip(start).take(body) {
-            let a = &r.agent;
-            let (icon, label, color) = status_style(&a.status, self.frame);
-            let tab = self.tab_tag(r);
-            let loc = self.location(r);
-            let ctx = self.ctx_label(a).unwrap_or("-".into());
-            let sel = i == self.selected;
-            // selected row = zellij's active-tab colours, same rules as the bar's focused chip
-            let ctx_col = match self.ctx_pct(a) {
-                Some(p) if p >= 80 => "\x1b[31m",
-                Some(p) if p >= 60 && !sel => "\x1b[33m",
-                _ => "",
-            };
-            let waiting = a.status == "needs_input";
-            // unread question: the status cell pulses; read: it stays amber, only the "?" blinks (below)
-            let on = (self.frame / 2) % 2 == 0;
-            let color = if waiting && !r.seen && on {
-                WAIT_BG
-            } else if sel && !waiting {
-                BOLD
-            } else {
-                color
-            };
-            let detail = if a.detail.is_empty() {
-                self.purpose(r)
-            } else {
-                format!("{} · {}", self.purpose(r), a.detail)
-            };
-            let active = self.active_style.as_deref().unwrap_or(REV);
-            let (pre, post) = if sel { (active, RESET) } else { ("", "") };
-            let icon = if waiting && r.seen && !on { " " } else { icon };
-            let marker = if r.focused { format!("▶{:<2}", i + 1) } else { format!(" {:<2}", i + 1) };
-            let _ = writeln!(o, 
-                "{pre}{marker} {color}{icon} {}{RESET}{pre}{}{}{}{ctx_col}{}{RESET}{pre}{}{}{}{post}",
-                trunc(label, 9),
-                trunc(&tab, 9) + " ",
-                trunc(&loc, 33) + " ",
-                trunc(&ago(now, a.status_since), 7),
-                trunc(&ctx, 6),
-                trunc(&short_model(&a.model), 12) + " ",
-                trunc(&ago(now, a.started_at), 7),
-                trunc(&detail, detail_w),
-            );
-            self.hits.push((3 + i - start, 0, cols, i));
+        let active = self.active_style.as_deref().unwrap_or(REV);
+        for (i, (cells, color, ctx_col)) in table.iter().enumerate().skip(start).take(body) {
+            let mut styles = [""; 9];
+            (styles[1], styles[7]) = (color, ctx_col);
+            lines.push(line(if i == self.selected { active } else { "" }, cells, &styles));
+            self.hits.push((hdr + i - start, 0, cols, i));
         }
         if self.rows.is_empty() {
-            let _ = writeln!(o, "{DIM}  no running agents found{RESET}");
+            lines.push(fit("", &[(DIM, "  no running agents found".into())], cols));
         }
-        o
+        lines.join("\n")
     }
+}
+
+const YELLOW: &str = "\x1b[33m";
+const RED: &str = "\x1b[31m";
+const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/// ctx and usage %: yellow from 60, red from 80
+fn pct_color(p: f64) -> &'static str {
+    if p >= 80.0 {
+        RED
+    } else if p >= 60.0 {
+        YELLOW
+    } else {
+        ""
+    }
+}
+
+/// Styled pieces as exactly `w` cells: cut with "…" when too long, padded with spaces otherwise.
+/// `base` (the selection colours) carries through every piece and the padding.
+fn fit(base: &str, pieces: &[(&str, String)], w: usize) -> String {
+    let mut o = String::new();
+    let mut left = w;
+    for (style, t) in pieces {
+        let t = if dw(t) > left { trunc(t, left) } else { t.clone() };
+        left -= dw(&t);
+        o.push_str(&format!("{base}{style}{t}{RESET}"));
+    }
+    format!("{o}{base}{}{RESET}", " ".repeat(left))
+}
+
+/// Local calendar date of an epoch-ms time: (month 1-12, day, weekday 0 = Sunday). Civil-from-days (H. Hinnant).
+fn local_date(ms: i64, utc_offset_s: i64) -> (usize, i64, usize) {
+    let days = (ms.div_euclid(1000) + utc_offset_s).div_euclid(86400);
+    let z = days + 719468;
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (m as usize, doy - (153 * mp + 2) / 5 + 1, (days + 4).rem_euclid(7) as usize)
 }

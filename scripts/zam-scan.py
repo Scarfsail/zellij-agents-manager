@@ -13,6 +13,9 @@ Cursor CLI: found by its cmdline plus the ~/.cursor/chats/<hash>/<agentId>/store
 Busy/idle and the current tool come from Cursor hooks (--cursor-hook), context usage from its
 status line (--cursor-statusline); both write ~/.cache/zellij-agents/cursor/<agent pid>.json.
 Without hooks, a recently written store.db means busy.
+
+Account usage (--fetch-usage): Claude's /usage numbers from api.anthropic.com/api/oauth/usage with the
+local login token, cached in ~/.cache/zellij-agents/usage/claude.json and refreshed in the background.
 """
 import fcntl
 import glob
@@ -34,6 +37,11 @@ HOOK_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.join(HOME, ".ca
 SEEN_DIR = os.path.join(os.path.dirname(HOOK_DIR), "seen")
 CURSOR_DIR = os.path.join(os.path.dirname(HOOK_DIR), "cursor")
 CURSOR_CHATS = os.path.join(HOME, ".cursor", "chats")
+USAGE_DIR = os.path.join(os.path.dirname(HOOK_DIR), "usage")
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+# refetch account usage when the cache is older than this; a running fetch blocks another for FETCH_WAIT_S
+USAGE_MAX_AGE_S = 60
+FETCH_WAIT_S = 30
 TAIL_BYTES = 256 * 1024
 # Without hooks, a Cursor agent counts as busy while its chat db was written within this many seconds
 CURSOR_BUSY_WINDOW_S = 4
@@ -55,6 +63,15 @@ def mark_seen(sid, ts):
     with open(tmp, "w") as f:
         f.write(str(int(ts)))
     os.replace(tmp, os.path.join(SEEN_DIR, sid))
+
+
+def write_json(path, obj):
+    """atomically replace path with obj as JSON"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = os.path.join(os.path.dirname(path), f".{os.path.basename(path)}.{os.getpid()}.tmp")
+    with open(tmp, "w") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
 
 
 def proc_env(pid):
@@ -253,9 +270,10 @@ def transcript_info(path):
     return info
 
 
-def hook_state(session_id):
+def hook_state(session_id, suffix=""):
+    """last hook event (<sid>.json), or with suffix ".status" the status line's record (<sid>.status.json)"""
     try:
-        with open(os.path.join(HOOK_DIR, f"{session_id}.json")) as f:
+        with open(os.path.join(HOOK_DIR, f"{session_id}{suffix}.json")) as f:
             return json.load(f)
     except (OSError, ValueError):
         return None
@@ -344,6 +362,7 @@ def claude_agents():
             "detail": detail,
             **pane_fields(pid, env),
             "version": s.get("version"),
+            "cost_usd": (hook_state(s.get("sessionId", ""), ".status") or {}).get("cost_usd"),
         }
         a.update(transcript_info(transcript_path(s.get("cwd", ""), s.get("sessionId", ""))))
         win = context_window(a.get("model"))
@@ -447,9 +466,27 @@ def cursor_statusline(chain):
         cursor_update(st)
     except Exception:
         pass
+    run_chain(chain, data)
+
+
+def run_chain(chain, data):
     if chain:
         # the user's own status line: same stdin, its stdout is ours
         sys.exit(subprocess.run(["sh", "-c", chain], input=data).returncode)
+
+
+def claude_statusline(chain):
+    """Claude Code status line wrapper: record the session's cost, then show the user's own status line"""
+    data = sys.stdin.buffer.read()
+    try:
+        p = json.loads(data)
+        sid = p.get("session_id") or ""
+        if sid and "/" not in sid and not sid.startswith("."):
+            cost = (p.get("cost") or {}).get("total_cost_usd")
+            write_json(os.path.join(HOOK_DIR, f"{sid}.status.json"), {"cost_usd": cost, "ts": int(time.time() * 1000)})
+    except Exception:
+        pass
+    run_chain(chain, data)
 
 
 CURSOR_BUSY = ("beforeSubmitPrompt", "preToolUse", "postToolUse", "postToolUseFailure")
@@ -549,17 +586,169 @@ def cursor_agents():
     return out
 
 
+def _epoch_ms(v):
+    """ISO string or epoch seconds -> epoch ms"""
+    from datetime import datetime
+
+    if isinstance(v, (int, float)):
+        return int(v * 1000)
+    return int(datetime.fromisoformat(v).timestamp() * 1000)
+
+
+def _next_month_ms():
+    """local midnight on the first day of next month, in epoch ms"""
+    t = time.localtime()
+    y, m = (t.tm_year + 1, 1) if t.tm_mon == 12 else (t.tm_year, t.tm_mon + 1)
+    return int(time.mktime((y, m, 1, 0, 0, 0, 0, 0, -1)) * 1000)
+
+
+def _reset(ms):
+    """a reset time, with the local UTC offset at that instant (the plugin has no time zone; DST may differ from now)"""
+    return {"resets_at": ms, "utc_offset_s": time.localtime(ms / 1000).tm_gmtoff}
+
+
+def normalize_usage(resp):
+    """the usage endpoint's response -> our cache fields; the one place to adapt when the API changes"""
+    out = {}
+    spend, extra = resp.get("spend"), resp.get("extra_usage")
+    if spend:
+        if spend.get("enabled") and spend.get("limit"):
+            used, limit = spend.get("used") or {}, spend["limit"]
+            out["credits"] = {
+                "used": used.get("amount_minor", 0) / 10 ** used.get("exponent", 0),
+                "limit": limit["amount_minor"] / 10 ** limit.get("exponent", 0),
+                "pct": spend.get("percent"),
+                "currency": used.get("currency") or limit.get("currency"),
+                **_reset(_next_month_ms()),
+            }
+    elif extra and extra.get("is_enabled") is not False and extra.get("monthly_limit") is not None:
+        scale = 10 ** (extra.get("decimal_places") or 0)
+        out["credits"] = {
+            "used": (extra.get("used_credits") or 0) / scale,
+            "limit": extra["monthly_limit"] / scale,
+            "pct": extra.get("utilization"),
+            **_reset(_next_month_ms()),
+        }
+    for key in ("five_hour", "seven_day"):
+        w = resp.get(key)
+        if w:
+            out[key] = {"pct": w.get("utilization")}
+            if w.get("resets_at") is not None:
+                out[key].update(_reset(_epoch_ms(w["resets_at"])))
+    return out or {"error": "unrecognized response"}
+
+
+def fetch_usage():
+    """fetch Claude's account usage into the cache; the token is only ever put in the request header"""
+    import urllib.error
+    import urllib.request
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args):
+            return None  # urllib would copy the Authorization header to the redirect target: fail with HTTP 3xx
+
+    res = {"fetched_at": int(time.time() * 1000)}
+    try:
+        try:
+            with open(os.path.join(CLAUDE_DIR, ".credentials.json")) as f:
+                token = json.load(f)["claudeAiOauth"]["accessToken"]
+        except (OSError, ValueError, KeyError, TypeError):
+            token = None
+        if not token:
+            res["error"] = "not logged in"
+        else:
+            req = urllib.request.Request(
+                USAGE_URL, headers={"Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20"}
+            )
+            with urllib.request.build_opener(NoRedirect).open(req, timeout=10) as r:
+                res.update(normalize_usage(json.load(r)))
+    except urllib.error.HTTPError as e:
+        res["error"] = "login expired" if e.code in (401, 403) else f"HTTP {e.code}"
+    except urllib.error.URLError as e:
+        res["error"] = str(e.reason)[:40]
+    except Exception as e:
+        res["error"] = type(e).__name__
+    try:
+        write_json(os.path.join(USAGE_DIR, "claude.json"), res)
+    finally:
+        try:
+            os.remove(os.path.join(USAGE_DIR, ".fetching"))
+        except OSError:
+            pass
+
+
+def _age_s(path):
+    try:
+        return time.time() - os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+def _claim_fetch(marker):
+    """atomically create the fetch marker; False while another fetch holds it (one older than FETCH_WAIT_S is stale)"""
+    for _ in range(2):
+        try:
+            os.close(os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            return True
+        except FileExistsError:
+            age = _age_s(marker)
+            if age is not None and age <= FETCH_WAIT_S:
+                return False
+            try:
+                os.remove(marker)
+            except FileNotFoundError:
+                pass
+    return False
+
+
+def claude_usage():
+    """the cached account usage; when stale, refresh it in the background so a scan never waits on the network"""
+    if not os.path.exists(os.path.join(CLAUDE_DIR, ".credentials.json")):
+        return None  # no Claude login (e.g. Cursor only): no fetch and no usage line
+    cache, marker = os.path.join(USAGE_DIR, "claude.json"), os.path.join(USAGE_DIR, ".fetching")
+    age = _age_s(cache)
+    if age is None or age > USAGE_MAX_AGE_S:
+        try:
+            os.makedirs(USAGE_DIR, exist_ok=True)
+            if _claim_fetch(marker):
+                subprocess.Popen(
+                    [sys.executable, "-I", os.path.abspath(__file__), "--fetch-usage"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+        except OSError:
+            pass  # a cache or spawn failure only loses the usage line, never the agent scan
+    try:
+        with open(cache) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
 def main():
     if len(sys.argv) >= 4 and sys.argv[1] == "--seen":
         mark_seen(sys.argv[2], sys.argv[3])
         return
     if sys.argv[1:2] == ["--cursor-hook"]:
         return cursor_hook()
+    chain = " ".join(sys.argv[3:] if sys.argv[2:3] == ["--"] else sys.argv[2:])
     if sys.argv[1:2] == ["--cursor-statusline"]:
-        return cursor_statusline(" ".join(sys.argv[3:] if sys.argv[2:3] == ["--"] else sys.argv[2:]))
+        return cursor_statusline(chain)
+    if sys.argv[1:2] == ["--claude-statusline"]:
+        return claude_statusline(chain)
+    if sys.argv[1:2] == ["--fetch-usage"]:
+        return fetch_usage()
     agents = claude_agents() + cursor_agents()
     agents.sort(key=lambda a: a.get("started_at", 0))
-    json.dump({"now": int(time.time() * 1000), "agents": agents}, sys.stdout, separators=(",", ":"))
+    usage = claude_usage()
+    out = {
+        "now": int(time.time() * 1000),
+        "agents": agents,
+        "usage": {"claude": usage} if usage else {},
+    }
+    json.dump(out, sys.stdout, separators=(",", ":"))
 
 
 if __name__ == "__main__":
