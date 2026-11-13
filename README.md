@@ -5,7 +5,7 @@ A Zellij plugin that shows every running coding agent (Claude Code and Cursor CL
 One WASM binary, two modes:
 
 - **`bar`**: a 2-row strip under the native tab bar. Each chip shows the agent number, status, repo@branch and context % on the first row and the session title on the second. Click a chip, or press `Ctrl+Alt+<number>`, to jump; `Ctrl+Alt+←/→` goes to the previous/next agent. The chip of the focused agent is reversed; `↗` marks an agent in another Zellij session. A working agent shows a spinning `◐`; the chip of an agent waiting on you shows `?` and pulses amber until you focus it; after that only the `?` pulses, until it asks something new (needs the hooks below).
-- **`panel`**: a full table (status, name, tab, time in status, ctx %, model, uptime, task title from the pane). `j/k` select, `enter`/click jump, `n` jump to the next agent waiting on you, `q`/`esc` hide. Best as a floating pane: clicking the bar's header block (` AGENTS N `) or `Ctrl+Alt+0` toggles it, or bind a key yourself (below).
+- **`panel`**: a full table (status, name, tab, time in status, ctx %, model, uptime, task title from the pane). `j/k` select, `enter`/click jump, `n` jump to the next agent waiting on you, `q`/`esc` close. Clicking the bar's header block (` AGENTS N `) or `Ctrl+Alt+0` toggles it as a floating pane right below the bar, or bind a key yourself (below).
 
 ## How detection works
 
@@ -100,7 +100,7 @@ zellij plugin --floating --configuration "mode=panel,scanner=$PWD/scripts/zam-sc
 
 Zellij asks for permissions on first load (read state, change state, run commands); press `y`.
 
-Clicking the bar's header (or `Ctrl+Alt+0`) toggles the panel without any setup: it opens a floating panel with the bar's own config and `mode=panel`. A keybinding of your own for the panel (add to the `shared_except "locked"` block of `config.kdl`):
+Clicking the bar's header (or `Ctrl+Alt+0`) toggles the panel without any setup: the bar opens its own pinned floating panel right below itself, full width and sized to the agents, with the bar's config and `mode=panel`. Other floating windows of the tab are tucked away while it is open and come back when it closes. A keybinding of your own for the panel still works on its own (add to the `shared_except "locked"` block of `config.kdl`):
 
 ```kdl
 bind "Alt a" {
@@ -113,8 +113,6 @@ bind "Alt a" {
 }
 ```
 
-The keybinding and the header click reach the same panel only when the plugin URL and the config (`scanner`, `interval`, …) match the bar layout's exactly, as absolute paths the way `install.sh` writes them (no `~`), plus `mode "panel"`; otherwise there are two panel instances.
-
 ## Config
 
 | key | default | |
@@ -122,5 +120,5 @@ The keybinding and the header click reach the same panel only when the plugin UR
 | `mode` | `bar` | `bar` or `panel` |
 | `scanner` | `zam-scan.py` | absolute path, or `~/…` |
 | `interval` | `2` | seconds between scans |
-| `hide_on_jump` | `true` | panel hides itself after jumping |
+| `hide_on_jump` | `true` | panel closes itself after jumping |
 | `debug_dump` | – | write each rendered frame to this path |

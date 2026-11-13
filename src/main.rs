@@ -54,6 +54,14 @@ struct Row {
     screen_pos: (bool, usize, usize),
 }
 
+/// Bar: the floating panel this bar opened, and the floating panes it hid to show the panel alone
+struct Panel {
+    id: u32,
+    /// listed in a PaneUpdate at least once: absent before that means "not yet listed", not "closed"
+    seen: bool,
+    stashed: Vec<PaneId>,
+}
+
 struct State {
     mode: Mode,
     /// our layout config, passed on (with mode=panel) to the panel the header toggles
@@ -72,6 +80,7 @@ struct State {
     hits: Vec<(usize, usize, usize, usize)>,
     /// width of the bar's header block from the last render (clicking it toggles the panel)
     header_w: usize,
+    panel: Option<Panel>,
     permitted: bool,
     scanning: bool,
     my_id: u32,
@@ -114,6 +123,7 @@ impl Default for State {
             selected: 0,
             hits: vec![],
             header_w: 0,
+            panel: None,
             permitted: false,
             scanning: false,
             my_id: 0,
@@ -209,6 +219,7 @@ impl ZellijPlugin for State {
             Event::PaneUpdate(pm) => {
                 self.panes = pm;
                 self.my_tab = self.my_pane().map(|(t, _)| t);
+                self.track_panel();
                 self.rebuild();
                 list_clients();
                 true
@@ -256,12 +267,13 @@ impl ZellijPlugin for State {
                         _ => None,
                     })
                     .collect();
-                if focus != self.client_focus {
+                let changed = focus != self.client_focus;
+                if changed {
                     self.client_focus = focus;
                     self.rebuild();
-                    return true;
                 }
-                false
+                self.track_panel(); // a panel that closed while our tab was off screen restores once it is back
+                changed
             }
             Event::SessionUpdate(sessions, _) => {
                 self.live_sessions = Some(sessions.into_iter().map(|s| s.name).collect());
@@ -270,12 +282,6 @@ impl ZellijPlugin for State {
             Event::RunCommandResult(code, out, err, ctx) => {
                 match ctx.get("zam").map(String::as_str) {
                     Some("scan") => {}
-                    // the header's launch-or-focus-plugin: only a failure is worth showing
-                    Some("panel") if code != Some(0) => {
-                        let e = String::from_utf8_lossy(&err).lines().last().unwrap_or("?").to_string();
-                        self.error = Some(format!("panel: {e}"));
-                        return true;
-                    }
                     _ => return false,
                 }
                 self.scanning = false;
@@ -335,7 +341,7 @@ impl ZellijPlugin for State {
                     false
                 }
                 BareKey::Esc | BareKey::Char('q') => {
-                    hide_self();
+                    close_self();
                     false
                 }
                 _ => false,
@@ -348,11 +354,12 @@ impl ZellijPlugin for State {
     /// only the instance on screen acts, so each press jumps once.
     fn pipe(&mut self, msg: PipeMessage) -> bool {
         // my_tab None = this instance hasn't learned where it is yet (e.g. never-visited tab): don't act
-        if msg.name != "zam_jump" || self.hidden || self.my_tab.is_none() || !self.permitted {
+        // the panel shares the bar's tab, so only the bar acts (else each press would jump twice)
+        if msg.name != "zam_jump" || self.mode != Mode::Bar || self.hidden || self.my_tab.is_none() || !self.permitted {
             return false;
         }
         match msg.payload.as_deref().map(str::trim) {
-            Some("panel") if self.mode == Mode::Bar => self.toggle_panel(),
+            Some("panel") => self.toggle_panel(),
             Some("next") => {
                 if let Some(i) = self.next_attention() {
                     self.selected = i;
@@ -429,38 +436,80 @@ impl State {
             .find_map(|(t, ps)| ps.iter().find(|p| p.is_plugin && p.id == self.my_id).map(|p| (*t, p)))
     }
 
-    /// Bar: hide the panel (same plugin, floating) if it is on screen in our tab, else launch or focus it in the focused
-    /// tab via the CLI, with our config and mode=panel; Zellij reuses a running instance with the same URL and config.
+    /// our tab's TabInfo
+    fn my_tab_info(&self) -> Option<&TabInfo> {
+        self.tabs.iter().find(|ti| Some(ti.position) == self.my_tab)
+    }
+
+    /// Bar: close our panel if it is open, else open it (this plugin, our config with mode=panel) pinned, full width,
+    /// right below the bar and sized to the agents. Zellij shows a tab's floating panes only as a whole layer, so if
+    /// that layer was hidden, the other floating panes it brings up are hidden again until the panel closes.
     fn toggle_panel(&mut self) {
-        let Some((tab, Some(url))) = self.my_pane().map(|(t, p)| (t, p.plugin_url.clone())) else {
-            return;
-        };
         if !self.permitted {
             return;
         }
-        // the panel is floating (bars are tiled); it is on screen only while the tab's floating layer is visible
-        let floating_visible = self.tabs.iter().any(|ti| ti.position == tab && ti.are_floating_panes_visible);
-        let shown = self.panes.panes.get(&tab).into_iter().flatten().find(|p| {
-            p.is_plugin && p.is_floating && !p.is_suppressed && p.id != self.my_id && p.plugin_url.as_ref() == Some(&url)
-        });
-        if let Some(id) = shown.filter(|_| floating_visible).map(|p| p.id) {
-            hide_pane_with_id(PaneId::Plugin(id));
-            // mark it suppressed now so a quick second toggle re-opens it instead of hiding it again before the PaneUpdate
-            if let Some(p) = self.panes.panes.get_mut(&tab).into_iter().flatten().find(|p| p.is_plugin && p.id == id) {
-                p.is_suppressed = true;
-            }
+        if let Some(p) = &mut self.panel {
+            close_plugin_pane(p.id);
+            p.seen = true; // closing: its next absence from the manifest is final (track_panel restores)
             return;
         }
+        let Some((tab, y, Some(url))) = self.my_pane().map(|(t, p)| (t, p.pane_y + p.pane_rows, p.plugin_url.clone()))
+        else {
+            return;
+        };
+        let Some(ti) = self.my_tab_info() else { return };
+        let layer_hidden = !ti.are_floating_panes_visible;
+        let height = (3 + self.rows.len() + 2).min(ti.viewport_rows / 2).max(6);
         let mut cfg = self.cfg.clone();
         cfg.insert("mode".into(), "panel".into());
-        let cfg = cfg.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(",");
-        let mut cmd = vec!["zellij"];
-        if let Some(s) = &self.session {
-            cmd.extend(["--session", s.as_str()]);
+        let coords = FloatingPaneCoordinates::new(
+            Some("0".into()),
+            Some(y.to_string()),
+            Some("100%".into()),
+            Some(height.to_string()),
+            Some(true),
+            None,
+        );
+        let Some(PaneId::Plugin(id)) = open_plugin_pane_floating(&url, cfg, coords, BTreeMap::new()) else {
+            self.error = Some("panel: could not open".into());
+            return;
+        };
+        let mut stashed = vec![];
+        if layer_hidden {
+            let others = self.panes.panes.get(&tab).into_iter().flatten();
+            for p in others.filter(|p| p.is_floating && !p.is_suppressed && !(p.is_plugin && p.id == id)) {
+                let pid = if p.is_plugin { PaneId::Plugin(p.id) } else { PaneId::Terminal(p.id) };
+                hide_pane_with_id(pid);
+                stashed.push(pid);
+            }
         }
-        cmd.extend(["action", "launch-or-focus-plugin", "--floating", "--move-to-focused-tab", "--configuration"]);
-        cmd.extend([cfg.as_str(), url.as_str()]);
-        run_command(&cmd, BTreeMap::from([("zam".to_string(), "panel".to_string())]));
+        self.panel = Some(Panel { id, seen: false, stashed });
+    }
+
+    /// Bar, on PaneUpdate and ListClients: once our panel is gone (toggle, q/esc, jump, closed by hand), bring back
+    /// the floating panes it hid and hide the floating layer again, as it was before, unless a client is now focused
+    /// on a floating pane of our tab. Waits while our tab is off screen: show_pane_with_id would switch to it.
+    fn track_panel(&mut self) {
+        let Some(p) = &mut self.panel else { return };
+        let listed = self.panes.panes.values().flatten().any(|q| q.is_plugin && q.id == p.id);
+        if listed || !p.seen {
+            p.seen |= listed;
+            return;
+        }
+        if self.hidden {
+            return;
+        }
+        let Some(p) = self.panel.take() else { return };
+        for &pid in &p.stashed {
+            show_pane_with_id(pid, true, false);
+        }
+        let Some((tab, tab_id)) = self.my_tab.zip(self.my_tab_info().map(|ti| ti.tab_id)) else { return };
+        let floating_focus = self.panes.panes.get(&tab).into_iter().flatten().any(|q| {
+            q.is_floating && !q.is_plugin && self.client_focus.contains(&q.id)
+        });
+        if !p.stashed.is_empty() && !floating_focus {
+            let _ = hide_floating_panes(Some(tab_id));
+        }
     }
 
     fn arm(&mut self, step: f64) {
@@ -584,7 +633,7 @@ impl State {
         let Some(row) = self.rows.get(idx) else { return };
         let Some(pane) = row.agent.pane_id else { return };
         if row.local {
-            focus_terminal_pane(pane, false, false);
+            focus_terminal_pane(pane, true, false); // a hidden floating pane comes back floating
         } else if let Some(s) = &row.agent.zellij_session {
             // switching to a name that isn't running would silently create an empty session
             if self.live_sessions.as_ref().map_or(true, |live| live.contains(s)) {
@@ -595,7 +644,7 @@ impl State {
             }
         }
         if self.mode == Mode::Panel && self.hide_on_jump {
-            hide_self();
+            close_self();
         }
     }
 
@@ -838,7 +887,7 @@ impl State {
         if let Some(e) = &self.error {
             let _ = writeln!(o, "\x1b[31m {}{RESET}", trunc(e, cols.saturating_sub(1)));
         } else {
-            let _ = writeln!(o, "{DIM} ↑↓/jk select · enter/click jump · n next waiting · q hide{RESET}");
+            let _ = writeln!(o, "{DIM} ↑↓/jk select · enter/click jump · n next waiting · q close{RESET}");
         }
         // columns: status(11) tab(10) location(34) since(7) ctx(6) model(13) up(7) task(rest)
         let fixed = 2 + 11 + 10 + 34 + 7 + 6 + 13 + 7;
