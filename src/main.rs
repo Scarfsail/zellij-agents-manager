@@ -963,7 +963,10 @@ impl State {
                     // the meter gets the rounded % it is printed next to, so 99.6 is a full meter beside "100%"
                     if let Some(p) = c.pct.map(f64::round) {
                         parts.push(("", " · ".into()));
-                        parts.push((pct_color(p), format!("{} {p:.0}%", meter(p))));
+                        let (lit, track) = meter(p);
+                        parts.push((pct_color(p), lit));
+                        parts.push((DIM, track));
+                        parts.push((pct_color(p), format!(" {p:.0}%")));
                     }
                     if c.resets_at > 0 {
                         let (m, d, _) = local_date(c.resets_at, c.utc_offset_s);
@@ -975,7 +978,10 @@ impl State {
                     let gap = if parts.is_empty() { "  " } else { "   " };
                     parts.push(("", format!("{gap}{label}")));
                     if let Some(p) = w.pct.map(f64::round) {
-                        parts.push((pct_color(p), format!(" {} {p:.0}%", meter(p))));
+                        let (lit, track) = meter(p);
+                        parts.push((pct_color(p), format!(" {lit}")));
+                        parts.push((DIM, track));
+                        parts.push((pct_color(p), format!(" {p:.0}%")));
                     }
                     if w.resets_at > 0 {
                         // the 5h window resets within hours: show how soon; the week: on which day
@@ -1002,6 +1008,7 @@ impl State {
         const WHERE: usize = 4;
         const TASK: usize = 5;
         const MODEL: usize = 6;
+        const CTX: usize = 7;
         const CAP: [usize; 9] = [usize::MAX, usize::MAX, usize::MAX, 12, 28, usize::MAX, 12, usize::MAX, usize::MAX];
         // below this, TASK is dropped rather than squeezed
         const TASK_MIN: usize = 10;
@@ -1027,9 +1034,9 @@ impl State {
         lines.extend(usage.iter().map(|l| fit("", l, cols)));
         let rule = fit("", &[(DIM, "─".repeat(cols))], cols);
         lines.push(rule.clone());
-        // every row's cells and the styles of its status and ctx cells, in column order
+        // every row's cells, the styles of its status and ctx cells and its lit meter cells (None: no meter), in column order
         let on = (self.frame / 2) % 2 == 0;
-        let table: Vec<([String; 9], &str, &str)> = self
+        let table: Vec<([String; 9], &str, &str, Option<usize>)> = self
             .rows
             .iter()
             .enumerate()
@@ -1047,6 +1054,7 @@ impl State {
                     color
                 };
                 let icon = if waiting && r.seen && !on { " " } else { icon };
+                let m = pct.map(|p| meter(p as f64));
                 let task = if a.detail.is_empty() { self.purpose(r) } else { format!("{} · {}", self.purpose(r), a.detail) };
                 let cells = [
                     format!("{}{}", if r.focused { "▶" } else { " " }, i + 1),
@@ -1057,13 +1065,13 @@ impl State {
                     task,
                     short_model(&a.model),
                     // a meter when the % is known; raw tokens (the bar's label) have none
-                    match pct {
-                        Some(p) => format!("{} {ctx}", meter(p as f64)),
+                    match &m {
+                        Some((lit, track)) => format!("{lit}{track} {ctx}"),
                         None => ctx,
                     },
                     a.cost_usd.map_or("-".into(), |c| format!("${c:.2}")),
                 ];
-                (cells, color, ctx_col)
+                (cells, color, ctx_col, m.map(|(lit, _)| lit.chars().count()))
             })
             .collect();
         // one set of widths for the header and every row: widest cell, capped; TASK at most what is left
@@ -1085,7 +1093,7 @@ impl State {
             }
         }
         let shown: Vec<usize> = (0..HEAD.len()).filter(|&c| c != TASK || task).collect();
-        let line = |base: &str, cells: &[String], styles: &[&str]| {
+        let line = |base: &str, cells: &[String], styles: &[&str], lit: Option<usize>| {
             let pieces: Vec<(&str, String)> = shown
                 .iter()
                 .enumerate()
@@ -1096,6 +1104,11 @@ impl State {
                     if c == WHERE {
                         let (repo, branch) = split_branch(&t);
                         vec![gap, (styles[c], repo.to_string()), (CYAN, branch.to_string())]
+                    } else if let (CTX, Some(n)) = (c, lit) {
+                        // CTX: lit meter cells and " 78%" in the ctx colour, the unlit track dim; split after truncation too
+                        let (lit, rest): (String, String) = (t.chars().take(n).collect(), t.chars().skip(n).collect());
+                        let (track, pct) = (rest.chars().take(5 - n).collect(), rest.chars().skip(5 - n).collect());
+                        vec![gap, (styles[c], lit), (DIM, track), (styles[c], pct)]
                     } else {
                         vec![gap, (styles[c], t)]
                     }
@@ -1103,7 +1116,7 @@ impl State {
                 .collect();
             fit(base, &pieces, cols)
         };
-        lines.push(line("", &HEAD.map(String::from), &[BOLD; 9]));
+        lines.push(line("", &HEAD.map(String::from), &[BOLD; 9], None));
         let hdr = Self::panel_header_lines(usage.len());
         // agent rows win over the footer: it shows only when a content line fits above it
         let content = rows.saturating_sub(hdr);
@@ -1114,10 +1127,10 @@ impl State {
         let start = if self.selected >= body { self.selected + 1 - body } else { 0 };
         // focused agent = zellij's active-tab colours on its "▶n" cell, like the bar's focused chip; selected row = grey
         let active = self.active_style.as_deref().unwrap_or(REV);
-        for (i, (cells, color, ctx_col)) in table.iter().enumerate().skip(start).take(body) {
+        for (i, (cells, color, ctx_col, lit)) in table.iter().enumerate().skip(start).take(body) {
             let mut styles = ["", "", DIM, LIGHT_GREY, "", "", LAVENDER, "", MAGENTA];
             (styles[0], styles[1], styles[7]) = (if self.rows[i].focused { active } else { "" }, color, ctx_col);
-            lines.push(line(if i == self.selected { GREY_BG } else { "" }, cells, &styles));
+            lines.push(line(if i == self.selected { GREY_BG } else { "" }, cells, &styles, *lit));
             self.hits.push((hdr + i - start, 0, cols, i));
         }
         if self.rows.is_empty() && body > 0 {
@@ -1172,11 +1185,14 @@ fn ctx_color(p: f64) -> &'static str {
     }
 }
 
-/// 5-cell braille meter for a %: each cell fills ⣀ → ⣿ in 6 steps (30 in all), rounded down, so only 100% is all ⣿.
-fn meter(pct: f64) -> String {
-    const STEPS: [char; 7] = ['⣀', '⣄', '⣤', '⣦', '⣶', '⣷', '⣿'];
-    let n = (pct * 0.3).floor().clamp(0.0, 30.0) as usize;
-    (0..5).map(|i| STEPS[n.saturating_sub(6 * i).min(6)]).collect()
+/// 5-cell braille meter for a % as (lit, track): each cell fills by pairs of dots, bottom row to top row, ⣀ → ⣤ → ⣶ → ⣿
+/// (4 steps per cell, 20 in all, 5% each), rounded down, so only 100% is all lit.
+/// The cells not reached are the track, a bare ⣀, for the caller to draw dim.
+fn meter(pct: f64) -> (String, String) {
+    const STEPS: [char; 4] = ['⣀', '⣤', '⣶', '⣿'];
+    let n = (pct * 20.0 / 100.0).floor().clamp(0.0, 20.0) as usize;
+    let lit = n.div_ceil(4);
+    ((0..lit).map(|i| STEPS[(n - 4 * i).min(4) - 1]).collect(), "⣀".repeat(5 - lit))
 }
 
 /// "repo@branch" as ("repo", "@branch"); no "@" leaves it all in the first part.
@@ -1282,14 +1298,23 @@ mod tests {
     }
 
     #[test]
-    fn meter_fills_braille_cells_in_6_steps() {
-        assert_eq!(meter(0.0), "⣀⣀⣀⣀⣀");
-        assert_eq!(meter(10.0), "⣦⣀⣀⣀⣀");
-        assert_eq!(meter(50.0), "⣿⣿⣦⣀⣀");
-        assert_eq!(meter(99.0), "⣿⣿⣿⣿⣷");
-        assert_eq!(meter(100.0), "⣿⣿⣿⣿⣿");
-        assert_eq!(meter(140.0), "⣿⣿⣿⣿⣿");
-        assert_eq!(dw(&meter(50.0)), 5);
+    fn meter_fills_cells_by_dot_pairs() {
+        let m = |p: f64| {
+            let (lit, track) = meter(p);
+            assert_eq!(lit.chars().count() + track.chars().count(), 5, "{p}%");
+            (lit, track)
+        };
+        let s = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(m(0.0), s("", "⣀⣀⣀⣀⣀"));
+        assert_eq!(m(5.0), s("⣀", "⣀⣀⣀⣀"));
+        assert_eq!(m(10.0), s("⣤", "⣀⣀⣀⣀"));
+        assert_eq!(m(20.0), s("⣿", "⣀⣀⣀⣀"));
+        assert_eq!(m(50.0), s("⣿⣿⣤", "⣀⣀"));
+        assert_eq!(m(99.0), s("⣿⣿⣿⣿⣶", ""));
+        assert_eq!(m(100.0), s("⣿⣿⣿⣿⣿", ""));
+        assert_eq!(m(140.0), s("⣿⣿⣿⣿⣿", ""));
+        assert_eq!(m(-5.0), s("", "⣀⣀⣀⣀⣀"));
+        assert_eq!(m(f64::NAN), s("", "⣀⣀⣀⣀⣀"));
     }
 
     #[test]
@@ -1327,6 +1352,9 @@ mod tests {
                 assert_eq!(dw(&strip(l)), cols, "{cols}: {:?}", strip(l));
             }
         }
+        // 78%: lit cells in the ctx colour (orange), the unreached track dim
+        let out = s.render_panel(20, 120);
+        assert!(out.contains("\x1b[38;5;208m⣿⣿⣿⣶") && out.contains("\x1b[2m⣀"), "{out:?}");
         // long WHERE and TAB narrow rather than push CTX and COST off the right
         for r in &mut s.rows {
             (r.agent.cwd, r.agent.branch) = (Some("/x/eng-intelligence".into()), Some("feat/168-long-branch-name".into()));
