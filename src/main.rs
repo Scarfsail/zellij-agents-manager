@@ -510,7 +510,7 @@ impl State {
         };
         let Some(ti) = self.my_tab_info() else { return };
         let layer_hidden = !ti.are_floating_panes_visible;
-        let height = (Self::panel_header_lines(self.usage_lines().len()) + self.rows.len() + 2).min(ti.viewport_rows / 2).max(6);
+        let height = (Self::panel_header_lines(self.usage_lines().len()) + self.rows.len().max(1) + PANEL_FOOTER_LINES + 2).min(ti.viewport_rows / 2).max(6);
         let mut cfg = self.cfg.clone();
         cfg.insert("mode".into(), "panel".into());
         cfg.insert("focus".into(), self.client_focus.iter().map(u32::to_string).collect::<Vec<_>>().join(","));
@@ -860,7 +860,7 @@ impl State {
         }
     }
 
-    /// Two-row bar. Row 0: status icon, tab, location, ctx. Row 1: purpose. Chips split by │.
+    /// Two-row bar. Row 0: purpose. Row 1: status icon, number, location, ctx. Chips split by │.
     fn render_bar(&mut self, cols: usize) -> String {
         const CHIP_MAX: usize = 36;
         let (needs, busy, idle, total) = self.counts();
@@ -879,8 +879,8 @@ impl State {
         if let Some(e) = &self.error {
             let e = trunc(e, cols.saturating_sub(x + 3).min(60));
             let w = dw(&e);
-            l0.push_str(&format!("{DIM}│{RESET} \x1b[31m{e}{RESET} "));
-            l1.push_str(&format!("{DIM}│{RESET} {} ", " ".repeat(w)));
+            l0.push_str(&format!("{DIM}│{RESET} {} ", " ".repeat(w)));
+            l1.push_str(&format!("{DIM}│{RESET} {RED}{e}{RESET} "));
             x += w + 3;
         }
         for i in 0..self.rows.len() {
@@ -889,17 +889,17 @@ impl State {
             let ctx = self.ctx_label(&r.agent).map(|c| format!(" {c}")).unwrap_or_default();
             // the number is the Alt+Shift+<n> jump key; ↗ = agent lives in another zellij session
             let remote = if !r.local && r.agent.zellij_session.is_some() { "↗" } else { "" };
-            let head = format!("{icon} {}{remote} ", i + 1);
-            let loc_w = CHIP_MAX.saturating_sub(dw(&head) + dw(&ctx));
+            let num = format!(" {}{remote} ", i + 1);
+            let loc_w = CHIP_MAX.saturating_sub(dw(icon) + dw(&num) + dw(&ctx));
             let loc = trunc(&self.location(r), loc_w).trim_end().to_string();
-            let top = format!("{head}{loc}{ctx}");
+            let status = format!("{icon}{num}{loc}{ctx}");
             let purpose = self.purpose(r);
-            let w = dw(&top).max(dw(&purpose).min(CHIP_MAX));
+            let w = dw(&status).max(dw(&purpose).min(CHIP_MAX));
             let remaining = self.rows.len() - i;
             let more = if remaining > 1 { dw(&format!(" +{}", remaining - 1)) } else { 0 };
             if x + 3 + w + more > cols {
                 let tag = format!(" +{remaining}");
-                l0.push_str(&format!("{DIM}{tag}{RESET}"));
+                l1.push_str(&format!("{DIM}{tag}{RESET}"));
                 break;
             }
             // focused chip = zellij's active-tab colours; its padding spaces carry the background too
@@ -916,21 +916,24 @@ impl State {
             l0.push_str(&format!("{DIM}│{RESET}{pre} "));
             l1.push_str(&format!("{DIM}│{RESET}{pre} "));
             x += 2;
-            // on the coloured background, status/ctx colours turn unreadable: use the theme's text colour,
-            // except the red "needs you" badge and a critical ctx, which must stand out
-            let ctx_col = match self.ctx_pct(&r.agent) {
-                _ if pulse => "",
-                Some(p) if p >= 80 => "\x1b[31m",
-                Some(p) if p >= 60 && !r.focused => "\x1b[33m",
-                _ if r.focused => "",
-                _ => DIM,
+            // on the coloured backgrounds (focused, pulsing) status/ctx colours turn unreadable: use the theme's
+            // text colour, except the "needs you" badge and (focused only) a critical ctx, which must stand out
+            let plain = !r.focused && !pulse;
+            let ctx_col = match self.ctx_pct(&r.agent).map(|p| ctx_color(p as f64)) {
+                Some(c) if plain || (c == RED && !pulse) => c,
+                None if plain => SOFT,
+                _ => "",
             };
+            let (soft, branch_col) = if plain { (SOFT, CYAN) } else { ("", "") };
+            let (repo, branch) = split_branch(&loc);
             let color = if pulse { "" } else if r.focused && !waiting { BOLD } else { color };
-            let pad0 = " ".repeat(w - dw(&top));
-            // blink "off": the "?" disappears, the orange number stays
-            let head = if icon_hidden { format!(" {}", &head[icon.len()..]) } else { head };
-            l0.push_str(&format!("{pre}{color}{head}{RESET}{pre}{BOLD}{loc}{RESET}{pre}{ctx_col}{ctx}{RESET}{pre}{pad0} {post}"));
-            l1.push_str(&format!("{pre}{} {post}", trunc(&purpose, w)));
+            let pad = " ".repeat(w - dw(&status));
+            // blink "off": the "?" disappears, the number stays
+            let icon = if icon_hidden { " " } else { icon };
+            l0.push_str(&format!("{pre}{} {post}", trunc(&purpose, w)));
+            l1.push_str(&format!(
+                "{pre}{color}{icon}{RESET}{pre}{soft}{num}{repo}{RESET}{pre}{branch_col}{branch}{RESET}{pre}{ctx_col}{ctx}{RESET}{pre}{pad} {post}"
+            ));
             self.hits.push((0, x, x + w, i));
             self.hits.push((1, x, x + w, i));
             x += w + 1;
@@ -953,10 +956,17 @@ impl State {
                         "USD" => "$".to_string(),
                         other => format!("{other} "),
                     };
-                    parts.push(("", format!("  credits {cur}{:.2} / {cur}{:.2}", c.used, c.limit)));
-                    if let Some(p) = c.pct {
+                    parts.push(("", "  credits ".into()));
+                    parts.push((MAGENTA, format!("{cur}{:.2}", c.used)));
+                    parts.push(("", " / ".into()));
+                    parts.push((MAGENTA, format!("{cur}{:.2}", c.limit)));
+                    // the meter gets the rounded % it is printed next to, so 99.6 is a full meter beside "100%"
+                    if let Some(p) = c.pct.map(f64::round) {
                         parts.push(("", " · ".into()));
-                        parts.push((pct_color(p), format!("{p:.0}%")));
+                        let (lit, track) = meter(p);
+                        parts.push((pct_color(p), lit));
+                        parts.push((DIM, track));
+                        parts.push((pct_color(p), format!(" {p:.0}%")));
                     }
                     if c.resets_at > 0 {
                         let (m, d, _) = local_date(c.resets_at, c.utc_offset_s);
@@ -967,7 +977,10 @@ impl State {
                     let Some(w) = w else { continue };
                     let gap = if parts.is_empty() { "  " } else { "   " };
                     parts.push(("", format!("{gap}{label}")));
-                    if let Some(p) = w.pct {
+                    if let Some(p) = w.pct.map(f64::round) {
+                        let (lit, track) = meter(p);
+                        parts.push((pct_color(p), format!(" {lit}")));
+                        parts.push((DIM, track));
                         parts.push((pct_color(p), format!(" {p:.0}%")));
                     }
                     if w.resets_at > 0 {
@@ -978,55 +991,61 @@ impl State {
                 }
             }
             if !parts.is_empty() {
-                lines.push([vec![(BOLD, format!(" {name}"))], parts].concat());
+                lines.push([vec![(BOLD, format!(" 📊 {name}"))], parts].concat());
             }
         }
         lines
     }
 
-    /// Panel lines above the agent rows: counts, vendor usage lines, help (or error), column header.
+    /// Panel lines above the agent rows: counts, vendor usage lines, rule, column header.
     fn panel_header_lines(vendor_lines: usize) -> usize {
         3 + vendor_lines
     }
 
     fn render_panel(&mut self, rows: usize, cols: usize) -> String {
-        const HEAD: [&str; 9] = ["", "STATUS", "FOR", "TAB", "WHERE", "TASK", "MODEL", "CTX", "COST"];
+        const HEAD: [&str; 9] = ["#", "STATUS", "FOR", "TAB", "WHERE", "TASK", "MODEL", "CTX", "COST"];
+        const TAB: usize = 3;
+        const WHERE: usize = 4;
         const TASK: usize = 5;
+        const MODEL: usize = 6;
+        const CTX: usize = 7;
         const CAP: [usize; 9] = [usize::MAX, usize::MAX, usize::MAX, 12, 28, usize::MAX, 12, usize::MAX, usize::MAX];
         // below this, TASK is dropped rather than squeezed
         const TASK_MIN: usize = 10;
+        // WHERE, TAB and MODEL narrow down to this before the line is cut
+        const FLEX_MIN: usize = 8;
         let mut lines = vec![];
         let (needs, busy, idle, total) = self.counts();
         let now = self.scan.now;
         lines.push(fit(
             "",
             &[
-                (BOLD, " Agents".into()),
-                ("", format!(" {total}  ")),
-                (if needs > 0 { WAIT_FG } else { DIM }, format!("{needs} need you")),
-                ("", "  ".into()),
-                (YELLOW, format!("{busy} working")),
-                ("", "  ".into()),
-                ("\x1b[32m", format!("{idle} idle")),
+                (BOLD, " 🤖 Agents".into()),
+                ("", format!(" {total}   ")),
+                (if needs > 0 { WAIT_FG } else { DIM }, format!("⏳ {needs} need you")),
+                ("", "   ".into()),
+                (YELLOW, format!("⚡ {busy} working")),
+                ("", "   ".into()),
+                ("\x1b[32m", format!("💤 {idle} idle")),
             ],
             cols,
         ));
         let usage = self.usage_lines();
         lines.extend(usage.iter().map(|l| fit("", l, cols)));
-        lines.push(match &self.error {
-            Some(e) => fit("", &[(RED, format!(" {e}"))], cols),
-            None => fit("", &[(DIM, " ↑↓/jk select · enter/click jump · n next waiting · q close".into())], cols),
-        });
-        // every row's cells and the styles of its status and ctx cells, in column order
+        let rule = fit("", &[(DIM, "─".repeat(cols))], cols);
+        lines.push(rule.clone());
+        // every row's cells, the styles of its status and ctx cells and its lit meter cells (None: no meter), in column order
         let on = (self.frame / 2) % 2 == 0;
-        let table: Vec<([String; 9], &str, &str)> = self
+        let table: Vec<([String; 9], &str, &str, Option<usize>)> = self
             .rows
             .iter()
             .enumerate()
             .map(|(i, r)| {
                 let a = &r.agent;
                 let (icon, label, color) = status_style(&a.status, self.frame);
-                let ctx_col = self.ctx_pct(a).map_or("", |p| pct_color(p as f64));
+                let pct = self.ctx_pct(a);
+                let ctx_col = pct.map_or("", |p| ctx_color(p as f64));
+                let ctx = self.ctx_label(a).unwrap_or_else(|| "-".into());
                 let waiting = a.status == "needs_input";
                 // unread question: the status cell pulses; read: it stays amber, only the "?" blinks
                 let color = if waiting && !r.seen && on {
@@ -1035,6 +1054,7 @@ impl State {
                     color
                 };
                 let icon = if waiting && r.seen && !on { " " } else { icon };
+                let m = pct.map(|p| meter(p as f64));
                 let task = if a.detail.is_empty() { self.purpose(r) } else { format!("{} · {}", self.purpose(r), a.detail) };
                 let cells = [
                     format!("{}{}", if r.focused { "▶" } else { " " }, i + 1),
@@ -1044,41 +1064,86 @@ impl State {
                     self.location(r),
                     task,
                     short_model(&a.model),
-                    self.ctx_label(a).unwrap_or("-".into()),
+                    // a meter when the % is known; raw tokens (the bar's label) have none
+                    match &m {
+                        Some((lit, track)) => format!("{lit}{track} {ctx}"),
+                        None => ctx,
+                    },
                     a.cost_usd.map_or("-".into(), |c| format!("${c:.2}")),
                 ];
-                (cells, color, ctx_col)
+                (cells, color, ctx_col, m.map(|(lit, _)| lit.chars().count()))
             })
             .collect();
-        // one set of widths for the header and every row: widest cell, capped; TASK gets what is left
+        // one set of widths for the header and every row: widest cell, capped; TASK at most what is left
         let mut w: Vec<usize> = (0..HEAD.len())
             .map(|c| table.iter().map(|t| dw(&t.0[c])).chain([dw(HEAD[c])]).max().unwrap_or(0).min(CAP[c]))
             .collect();
-        let rest = cols.saturating_sub(w.iter().sum::<usize>() - w[TASK] + 2 * (HEAD.len() - 1));
-        w[TASK] = rest;
-        let shown: Vec<usize> = (0..HEAD.len()).filter(|&c| c != TASK || rest >= TASK_MIN).collect();
-        let line = |base: &str, cells: &[String], styles: &[&str]| {
+        let gaps = 2 * (HEAD.len() - 1);
+        let rest = cols.saturating_sub(w.iter().sum::<usize>() - w[TASK] + gaps);
+        // TASK shows when its widest cell fits, or at least TASK_MIN cells do
+        let task = rest >= TASK_MIN.min(w[TASK]);
+        w[TASK] = w[TASK].min(rest);
+        // no TASK and still too wide: narrow WHERE, then TAB, then MODEL, so CTX and COST are not cut off the right
+        if !task {
+            let mut over = (w.iter().sum::<usize>() - w[TASK] + gaps - 2).saturating_sub(cols);
+            for c in [WHERE, TAB, MODEL] {
+                let cut = over.min(w[c].saturating_sub(FLEX_MIN));
+                w[c] -= cut;
+                over -= cut;
+            }
+        }
+        let shown: Vec<usize> = (0..HEAD.len()).filter(|&c| c != TASK || task).collect();
+        let line = |base: &str, cells: &[String], styles: &[&str], lit: Option<usize>| {
             let pieces: Vec<(&str, String)> = shown
                 .iter()
                 .enumerate()
-                .flat_map(|(k, &c)| [("", if k > 0 { "  " } else { "" }.to_string()), (styles[c], trunc(&cells[c], w[c]))])
+                .flat_map(|(k, &c)| {
+                    let t = trunc(&cells[c], w[c]);
+                    let gap = ("", if k > 0 { "  " } else { "" }.to_string());
+                    // WHERE: "@branch" in cyan, split after truncation so the width stays the same
+                    if c == WHERE {
+                        let (repo, branch) = split_branch(&t);
+                        vec![gap, (styles[c], repo.to_string()), (CYAN, branch.to_string())]
+                    } else if let (CTX, Some(n)) = (c, lit) {
+                        // CTX: lit meter cells and " 78%" in the ctx colour, the unlit track dim; split after truncation too
+                        let (lit, rest): (String, String) = (t.chars().take(n).collect(), t.chars().skip(n).collect());
+                        let (track, pct) = (rest.chars().take(5 - n).collect(), rest.chars().skip(5 - n).collect());
+                        vec![gap, (styles[c], lit), (DIM, track), (styles[c], pct)]
+                    } else {
+                        vec![gap, (styles[c], t)]
+                    }
+                })
                 .collect();
             fit(base, &pieces, cols)
         };
-        lines.push(line("", &HEAD.map(String::from), &[DIM; 9]));
+        lines.push(line("", &HEAD.map(String::from), &[BOLD; 9], None));
         let hdr = Self::panel_header_lines(usage.len());
-        let body = rows.saturating_sub(hdr);
+        // agent rows win over the footer: it shows only when a content line fits above it
+        let content = rows.saturating_sub(hdr);
+        let footer = content > PANEL_FOOTER_LINES;
+        // an error always shows: with no room for the footer it takes the last line on its own
+        let error_only = !footer && content > 0 && self.error.is_some();
+        let body = content - if footer { PANEL_FOOTER_LINES } else { error_only as usize };
         let start = if self.selected >= body { self.selected + 1 - body } else { 0 };
         // focused agent = zellij's active-tab colours on its "▶n" cell, like the bar's focused chip; selected row = grey
         let active = self.active_style.as_deref().unwrap_or(REV);
-        for (i, (cells, color, ctx_col)) in table.iter().enumerate().skip(start).take(body) {
-            let mut styles = [""; 9];
+        for (i, (cells, color, ctx_col, lit)) in table.iter().enumerate().skip(start).take(body) {
+            let mut styles = ["", "", DIM, LIGHT_GREY, "", "", LAVENDER, "", MAGENTA];
             (styles[0], styles[1], styles[7]) = (if self.rows[i].focused { active } else { "" }, color, ctx_col);
-            lines.push(line(if i == self.selected { GREY_BG } else { "" }, cells, &styles));
+            lines.push(line(if i == self.selected { GREY_BG } else { "" }, cells, &styles, *lit));
             self.hits.push((hdr + i - start, 0, cols, i));
         }
-        if self.rows.is_empty() {
+        if self.rows.is_empty() && body > 0 {
             lines.push(fit("", &[(DIM, "  no running agents found".into())], cols));
+        }
+        if footer || error_only {
+            if footer {
+                lines.push(rule);
+            }
+            lines.push(match &self.error {
+                Some(e) => fit("", &[(RED, format!(" {e}"))], cols),
+                None => fit("", &[(DIM, " ↑↓/jk select · ⏎/click jump · n next waiting · q close".into())], cols),
+            });
         }
         lines.join("\n")
     }
@@ -1086,10 +1151,19 @@ impl State {
 
 const YELLOW: &str = "\x1b[33m";
 const RED: &str = "\x1b[31m";
+// @branch (bar and panel WHERE), COST and credits money, panel TAB and MODEL: match the Claude status line
+const CYAN: &str = "\x1b[36m";
+const MAGENTA: &str = "\x1b[35m";
+/// the bar's status row: number and repo, softer than the purpose above it
+const SOFT: &str = "\x1b[38;5;245m";
+const LIGHT_GREY: &str = "\x1b[37m";
+const LAVENDER: &str = "\x1b[38;5;147m";
+/// Panel lines below the agent rows: rule, help (or error).
+const PANEL_FOOTER_LINES: usize = 2;
 const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
-/// ctx and usage %: yellow from 60, red from 80
+/// usage %: yellow from 60, red from 80
 fn pct_color(p: f64) -> &'static str {
     if p >= 80.0 {
         RED
@@ -1098,6 +1172,32 @@ fn pct_color(p: f64) -> &'static str {
     } else {
         ""
     }
+}
+
+/// ctx % colour (panel and bar): green up to 50, orange above, red above 80
+fn ctx_color(p: f64) -> &'static str {
+    if p > 80.0 {
+        RED
+    } else if p > 50.0 {
+        "\x1b[38;5;208m"
+    } else {
+        "\x1b[32m"
+    }
+}
+
+/// 5-cell braille meter for a % as (lit, track): each cell fills by pairs of dots, bottom row to top row, ⣀ → ⣤ → ⣶ → ⣿
+/// (4 steps per cell, 20 in all, 5% each), rounded down, so only 100% is all lit.
+/// The cells not reached are the track, a bare ⣀, for the caller to draw dim.
+fn meter(pct: f64) -> (String, String) {
+    const STEPS: [char; 4] = ['⣀', '⣤', '⣶', '⣿'];
+    let n = (pct * 20.0 / 100.0).floor().clamp(0.0, 20.0) as usize;
+    let lit = n.div_ceil(4);
+    ((0..lit).map(|i| STEPS[(n - 4 * i).min(4) - 1]).collect(), "⣀".repeat(5 - lit))
+}
+
+/// "repo@branch" as ("repo", "@branch"); no "@" leaves it all in the first part.
+fn split_branch(s: &str) -> (&str, &str) {
+    s.split_at(s.find('@').unwrap_or(s.len()))
 }
 
 /// Styled pieces as exactly `w` cells: cut with "…" when too long, padded with spaces otherwise.
@@ -1123,4 +1223,175 @@ fn local_date(ms: i64, utc_offset_s: i64) -> (usize, i64, usize) {
     let mp = (5 * doy + 2) / 153;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     (m as usize, doy - (153 * mp + 2) / 5 + 1, (days + 4).rem_euclid(7) as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// a rendered line without its ANSI colour codes
+    fn strip(l: &str) -> String {
+        let mut o = String::new();
+        let mut esc = false;
+        for c in l.chars() {
+            match c {
+                '\x1b' => esc = true,
+                'm' if esc => esc = false,
+                _ if !esc => o.push(c),
+                _ => {}
+            }
+        }
+        o
+    }
+
+    /// bar: purpose on the first row, status + repo@branch on the second, both rows equally wide
+    #[test]
+    fn bar_rows() {
+        let mut s = State::default();
+        let agent = Agent { status: "idle".into(), cwd: Some("/x/svc".into()), branch: Some("main".into()), ctx_pct: Some(78.0), title: "fix login".into(), ..Default::default() };
+        s.rows = vec![Row { agent, tab_pos: None, pane_title: String::new(), local: true, focused: false, seen: false, screen_pos: (false, 0, 0) }];
+        let out = s.render_bar(120);
+        let lines: Vec<String> = out.split('\n').map(strip).collect();
+        assert!(lines[0].contains("fix login") && lines[1].contains("svc@main 78%"), "{lines:?}");
+        assert_eq!(dw(&lines[0]), dw(&lines[1]), "{lines:?}");
+
+        // focused + seen needs_input chips, with the "?" shown and hidden: rows stay equal width, hits match the chips
+        let agent = |status: &str, title: &str| Agent { status: status.into(), cwd: Some("/x/svc".into()), branch: Some("main".into()), ctx_pct: Some(90.0), title: title.into(), ..Default::default() };
+        let row = |agent, focused, seen| Row { agent, tab_pos: None, pane_title: String::new(), local: true, focused, seen, screen_pos: (false, 0, 0) };
+        // the display cells [a, b) of a line
+        let cells = |l: &str, a: usize, b: usize| {
+            let (mut x, mut out) = (0, String::new());
+            for ch in l.chars() {
+                let w = dw(&ch.to_string());
+                if x >= a && x + w <= b {
+                    out.push(ch);
+                }
+                x += w;
+            }
+            out
+        };
+        s.rows = vec![row(agent("idle", "first"), true, false), row(agent("needs_input", "second"), false, true), row(agent("busy", "third"), false, false)];
+        for frame in [0, 2] {
+            s.frame = frame;
+            s.hits.clear();
+            let lines: Vec<String> = s.render_bar(120).split('\n').map(strip).collect();
+            assert_eq!(dw(&lines[0]), dw(&lines[1]), "frame {frame}: {lines:?}");
+            for (n, title) in ["first", "second", "third"].iter().enumerate() {
+                let h0 = s.hits.iter().find(|h| h.0 == 0 && h.3 == n).unwrap();
+                let h1 = s.hits.iter().find(|h| h.0 == 1 && h.3 == n).unwrap();
+                assert_eq!((h0.1, h0.2), (h1.1, h1.2));
+                assert!(cells(&lines[0], h0.1, h0.2).trim_end() == *title, "frame {frame} chip {n}: {lines:?}");
+                assert!(cells(&lines[1], h1.1, h1.2).contains(&format!(" {} svc@main", n + 1)), "frame {frame} chip {n}: {lines:?}");
+            }
+            // the "?" is in the second chip's range only while shown (the header's "?0" is outside every chip)
+            let h = s.hits.iter().find(|h| h.0 == 1 && h.3 == 1).unwrap();
+            assert_eq!(cells(&lines[1], h.1, h.2).contains('?'), frame == 0, "frame {frame}: {lines:?}");
+        }
+
+        // too narrow for every chip: "+N" appears and no row is wider than the bar
+        s.frame = 0;
+        for cols in [60, 40] {
+            s.hits.clear();
+            let lines: Vec<String> = s.render_bar(cols).split('\n').map(strip).collect();
+            assert!(lines[1].contains(" +") && dw(&lines[0]) <= cols && dw(&lines[1]) <= cols, "cols {cols}: {lines:?}");
+        }
+    }
+
+    #[test]
+    fn meter_fills_cells_by_dot_pairs() {
+        let m = |p: f64| {
+            let (lit, track) = meter(p);
+            assert_eq!(lit.chars().count() + track.chars().count(), 5, "{p}%");
+            (lit, track)
+        };
+        let s = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(m(0.0), s("", "⣀⣀⣀⣀⣀"));
+        assert_eq!(m(5.0), s("⣀", "⣀⣀⣀⣀"));
+        assert_eq!(m(10.0), s("⣤", "⣀⣀⣀⣀"));
+        assert_eq!(m(20.0), s("⣿", "⣀⣀⣀⣀"));
+        assert_eq!(m(50.0), s("⣿⣿⣤", "⣀⣀"));
+        assert_eq!(m(99.0), s("⣿⣿⣿⣿⣶", ""));
+        assert_eq!(m(100.0), s("⣿⣿⣿⣿⣿", ""));
+        assert_eq!(m(140.0), s("⣿⣿⣿⣿⣿", ""));
+        assert_eq!(m(-5.0), s("", "⣀⣀⣀⣀⣀"));
+        assert_eq!(m(f64::NAN), s("", "⣀⣀⣀⣀⣀"));
+    }
+
+    #[test]
+    fn split_branch_after_trunc() {
+        assert_eq!(split_branch("repo@branch"), ("repo", "@branch"));
+        assert_eq!(split_branch("repo"), ("repo", ""));
+        assert_eq!(split_branch(&trunc("repo@branch", 8)), ("repo", "@br…"));
+    }
+
+    /// every panel line is exactly `cols` cells wide, at a wide and a narrow width
+    #[test]
+    fn panel_lines_fill_width() {
+        let mut s = State::default();
+        s.scan = serde_json::from_str(r#"{"now": 100000, "agents": [], "usage": {"claude": {
+            "five_hour": {"pct": 48, "resets_at": 200000}, "seven_day": {"pct": 23}}}}"#)
+        .unwrap();
+        let agent = |status: &str, ctx_pct, branch: &str| Agent {
+            status: status.into(),
+            cwd: Some("/x/svc".into()),
+            branch: Some(branch.into()),
+            ctx_pct,
+            ctx_tokens: Some(156000),
+            title: "fix login".into(),
+            cost_usd: Some(1.2),
+            ..Default::default()
+        };
+        let row = |agent| Row { agent, tab_pos: None, pane_title: String::new(), local: true, focused: false, seen: false, screen_pos: (false, 0, 0) };
+        s.rows = vec![row(agent("needs_input", Some(78.0), "main")), row(agent("busy", None, "feat/5")), row(agent("idle", Some(5.0), "x"))];
+        for cols in [120, 40, 8] {
+            let out = s.render_panel(20, cols);
+            let lines: Vec<&str> = out.split('\n').collect();
+            // counts, usage, rule, column header, 3 agents, rule, help
+            assert_eq!(lines.len(), State::panel_header_lines(1) + 3 + PANEL_FOOTER_LINES);
+            for l in lines {
+                assert_eq!(dw(&strip(l)), cols, "{cols}: {:?}", strip(l));
+            }
+        }
+        // 78%: lit cells in the ctx colour (orange), the unreached track dim
+        let out = s.render_panel(20, 120);
+        assert!(out.contains("\x1b[38;5;208m⣿⣿⣿⣶") && out.contains("\x1b[2m⣀"), "{out:?}");
+        // long WHERE and TAB narrow rather than push CTX and COST off the right
+        for r in &mut s.rows {
+            (r.agent.cwd, r.agent.branch) = (Some("/x/eng-intelligence".into()), Some("feat/168-long-branch-name".into()));
+            (r.agent.model, r.agent.cost_usd, r.local, r.agent.zellij_session) = (Some("claude-sonnet-5-5".into()), Some(12.34), false, Some("work-session-long".into()));
+        }
+        // at 70 cols WHERE, TAB and MODEL all narrow (TASK dropped), and CTX and COST still show
+        for cols in [70, 80, 100] {
+            let out = s.render_panel(20, cols);
+            let lines: Vec<String> = out.split('\n').map(strip).collect();
+            let head = &lines[State::panel_header_lines(1) - 1];
+            assert!(head.contains("CTX") && head.contains("COST"), "{cols}: {head:?}");
+            let first = &lines[State::panel_header_lines(1)];
+            assert!(first.contains("$12.34") && first.contains("78%"), "{cols}: {first:?}");
+            assert!(lines.iter().all(|l| dw(l) == cols), "{cols}: {lines:?}");
+        }
+        // a short TASK leaves the spare width at the end, not between TASK and MODEL
+        let out = s.render_panel(20, 200);
+        let head = strip(out.split('\n').nth(State::panel_header_lines(1) - 1).unwrap());
+        assert!(dw(&head[..head.find("CTX").unwrap()]) < 200 - 20 && dw(&head) == 200, "{head:?}");
+        // a short pane keeps an agent row over the footer and never overflows
+        let hdr = State::panel_header_lines(1);
+        for rows in [hdr + 1, hdr + 2, hdr + 3] {
+            s.hits.clear();
+            let out = s.render_panel(rows, 120);
+            assert!(out.split('\n').count() <= rows);
+            assert!(!s.hits.is_empty());
+            assert!(s.hits.iter().all(|h| h.0 < rows));
+        }
+        // an error still shows on the last line when the footer does not fit
+        s.error = Some("scan failed".into());
+        for rows in [hdr + 1, hdr + 2] {
+            s.hits.clear();
+            let out = s.render_panel(rows, 120);
+            let lines: Vec<&str> = out.split('\n').collect();
+            assert!(lines.len() <= rows && strip(lines.last().unwrap()).contains("scan failed"), "{rows}: {lines:?}");
+            assert!(s.hits.iter().all(|h| h.0 < rows - 1));
+        }
+        assert_eq!(s.hits.len(), 1);
+    }
 }
