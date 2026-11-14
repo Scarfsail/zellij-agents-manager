@@ -1107,7 +1107,13 @@ impl State {
             ],
             cols,
         ));
-        let usage = self.usage_lines(cols);
+        let mut usage = self.usage_lines(cols);
+        // a short panel keeps at least one agent row: continuation lines go first, from the bottom, then vendor lines
+        let room = rows.saturating_sub(Self::panel_header_lines(0) + 1);
+        while usage.len() > room {
+            let i = usage.iter().rposition(|l| l[0].0 != BOLD).unwrap_or(usage.len() - 1);
+            usage.remove(i);
+        }
         lines.extend(usage.iter().map(|l| fit("", l, cols)));
         let rule = fit("", &[(DIM, "─".repeat(cols))], cols);
         lines.push(rule.clone());
@@ -1568,6 +1574,16 @@ mod tests {
                 assert!(u.chars().take(col).all(|c| c == ' ') && !u.chars().nth(col).unwrap().is_whitespace(), "{u:?}");
             }
         }
+        // a 40x20 viewport: a 10-row pane, 8 rows inside; usage keeps its first line and drops what leaves no agent row
+        s.rows = vec![Row { agent: Agent { status: "idle".into(), ..Default::default() }, tab_pos: None, pane_title: String::new(), local: true, focused: false, seen: false, screen_pos: (false, 0, 0) }];
+        for rows in [8, 6, 5] {
+            s.hits.clear();
+            let lines: Vec<String> = s.render_panel(rows, 40).split('\n').map(strip).collect();
+            assert!(lines.len() <= rows && lines[1].starts_with(" 📊 Agy  gemini 5h"), "{rows}: {lines:?}");
+            assert!(lines.iter().any(|l| l.starts_with(" 1  ○ idle")) && s.hits.len() == 1 && s.hits[0].0 < rows, "{rows}: {lines:?}");
+            assert!(lines.iter().all(|l| dw(l) == 40), "{rows}: {lines:?}");
+        }
+        s.rows.clear();
         // wide enough: one line, as before
         assert_eq!(s.usage_lines(250).len(), 1);
         for cols in [120, 40, 8] {
