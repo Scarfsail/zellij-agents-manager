@@ -641,7 +641,7 @@ CODEX_BASELINE_TOKENS = 12000
 
 
 def is_codex(pid):
-    """the native codex binary (not its node wrapper) running the interactive TUI"""
+    """the native codex binary (not its node wrapper) running the interactive TUI: False, else (its -C/--cd dir or None,)"""
     try:
         exe = os.readlink(f"/proc/{pid}/exe")
         if os.path.basename(exe.removesuffix(" (deleted)")) != "codex":  # " (deleted)": upgraded on disk
@@ -653,17 +653,23 @@ def is_codex(pid):
     # argv[0] is codex for the TUI (the npm wrapper passes the binary's path); helpers re-exec it under their own name
     if os.path.basename(argv[0]) != b"codex":
         return False
-    i, image = 1, False
+    i, image, cd = 1, False, None
     while i < len(argv) and argv[i] != b"--":  # the first positional after the options: a subcommand or the prompt
         a = argv[i]
         if a.startswith(b"-"):
             image = a in (b"-i", b"--image")
+            if a in (b"-C", b"--cd") and i + 1 < len(argv):
+                cd = argv[i + 1]
+            elif a.startswith(b"--cd="):
+                cd = a[5:]
+            elif a.startswith(b"-C"):
+                cd = a[2:]
             i += 2 if a in CODEX_OPT_VALUE else 1
         elif image:
             i += 1
         else:
             break
-    return i >= len(argv) or argv[i] not in CODEX_NON_TUI
+    return (os.fsdecode(cd) if cd else None,) if i >= len(argv) or argv[i] not in CODEX_NON_TUI else False
 
 
 def codex_query(sql, *args):
@@ -785,13 +791,16 @@ def codex_agents():
     for d in glob.glob("/proc/[0-9]*"):
         pid = int(d[6:])
         try:
-            if not is_codex(pid):
+            tui = is_codex(pid)
+            if not tui:
                 continue
             env = proc_env(pid)
             if not env or not env.get("ZELLIJ_PANE_ID"):
                 continue
             started = proc_started_ms(pid)
             cwd = os.readlink(f"{d}/cwd")
+            if tui[0]:  # -C/--cd moves the thread's working dir, not the process's
+                cwd = os.path.realpath(os.path.join(cwd, tui[0]))
             try:
                 # the TUI names no thread anywhere: take the newest one it can own (not a subagent's or codex exec's)
                 rows = codex_query(
