@@ -214,6 +214,23 @@ class SetupTest(unittest.TestCase):
         for l in own:
             self.assertIn(" " * 12 + l + "\n", self.layout_text())
 
+    def test_tab_separated_plugin_lines(self):
+        # KDL whitespace between name and value may be a tab: read back, and replaced (not duplicated) by --opt
+        self.sh("./install.sh")
+        self.hand_edit_plugin_block(["notify\tfalse", "interval\t5"])
+        self.assertEqual(zs.read_state().opts, {"notify": "false", "interval": "5"})
+        s = self.status()
+        self.assertEqual((s["notify"], s["interval"]), ("off", "5 s"))
+        st = zs.read_state()
+        with self.backends() as run:
+            zs.set_opt(st, "notify", "true")
+        self.assertEqual([c[0][0][1:] for c in run.call_args_list], [["--mod", "Ctrl Alt", "--opt", "notify="]])
+        self.assertNotIn("notify", self.layout_text())
+        self.assertIn(" " * 12 + "interval\t5\n", self.layout_text())
+        self.sh("./install.sh", "--opt", "interval=3")
+        self.assertEqual(self.layout_text().count("interval"), 1)
+        self.assertEqual(zs.read_state().opts, {"interval": "3"})
+
     def test_non_ascii_opt(self):
         self.sh("./install.sh", "--opt", "debug_dump=/tmp/ž")
         self.assertIn('debug_dump "/tmp/ž"\n', self.layout_text())
@@ -240,6 +257,43 @@ class SetupTest(unittest.TestCase):
             self.assertNotIn("replaced", text)
             with mock.patch.object(zs, "pick", side_effect=[0, 1]), self.backends():
                 zs.act_default_layout(zs.read_state())
+
+    ALT_PANE = 'keybinds {\n    normal {\n        bind "Alt p" { SwitchToMode "pane"; }\n    }\n}\n'
+
+    def test_install_layouts_confirms_clashes(self):
+        # a fresh install puts the jump keys on the detected Alt, which clashes with the stock Alt Left/Right
+        self.config(self.ALT_PANE)
+        before = self.mtimes()
+        st = zs.read_state()
+        with mock.patch.object(zs, "pick", side_effect=[0, 0]) as pick, self.backends() as run:
+            self.assertFalse(zs.act_layouts(st))  # Install, then Cancel at the clashes
+        self.assertIn("Alt Left", pick.call_args[0][0])
+        self.assertEqual((run.call_count, self.mtimes()), (0, before))
+        with mock.patch.object(zs, "pick", side_effect=[0, 1]), self.backends():
+            zs.act_layouts(zs.read_state())  # Install, then Use Alt anyway
+        self.assertTrue(self.status()["jump keys"].startswith("installed: Alt  ⚠ clashes with Alt Left"))
+
+    def test_default_layout_confirms_clashes(self):
+        # turning default_layout on installs the jump keys too: on, from off and from another layout
+        self.config(self.ALT_PANE)
+        before = self.mtimes()
+        st = zs.read_state()
+        with mock.patch.object(zs, "pick", side_effect=[0, 0]) as pick, self.backends() as run:
+            self.assertFalse(zs.act_default_layout(st))  # on, then Cancel at the clashes
+        self.assertIn("Alt Left", pick.call_args[0][0])
+        self.assertEqual((run.call_count, self.mtimes()), (0, before))
+        self.config('default_layout "compact"\n' + self.ALT_PANE)
+        before = self.mtimes()
+        st = zs.read_state()
+        with mock.patch.object(zs, "pick", side_effect=[0, 1, 0]) as pick, self.backends() as run:
+            self.assertFalse(zs.act_default_layout(st))  # switch, yes, then Cancel at the clashes
+        self.assertIn("Alt Left", pick.call_args[0][0])
+        self.assertEqual((run.call_count, self.mtimes()), (0, before))
+        with mock.patch.object(zs, "pick", side_effect=[0, 1, 1]), self.backends():
+            zs.act_default_layout(zs.read_state())  # switch, yes, Use Alt anyway
+        s = self.status()
+        self.assertEqual(s["default_layout"], "on")
+        self.assertTrue(s["jump keys"].startswith("installed: Alt "), s["jump keys"])
 
     def test_remove_layouts_warns_about_own_default_layout(self):
         self.config('default_layout "agents"\n')

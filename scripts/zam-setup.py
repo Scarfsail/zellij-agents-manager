@@ -139,7 +139,7 @@ def plugin_opts(layout_text):
     m = re.search(r'plugin location="file:[^"]*zellij-agents\.wasm" \{\n(.*?)\n\s*\}', layout_text or "", re.S)
     opts = {}
     for line in m.group(1).splitlines() if m else []:
-        k, _, v = line.strip().partition(" ")
+        k, v = (line.split(None, 1) + [""])[:2]  # KDL whitespace: a tab as well as a space
         v = v.strip()
         if k and v and not k.startswith("/") and k not in ("mode", "scanner"):
             try:
@@ -359,8 +359,28 @@ def run(cmds):
     return True
 
 
-def zellij_change(st, **want):
+def same_mod(a, b):
+    return bool(a and b) and norm(a + " x") == norm(b + " x")
+
+
+def cmds_mod(cmds):
+    """the modifier install.sh runs pass as --mod, if any"""
+    return next((c[c.index("--mod") + 1] for c in cmds if "--mod" in c), None)
+
+
+def mod_ok(st, m):
+    """a modifier newly getting the jump keys: its clashes shown and confirmed first"""
+    c = [] if same_mod(m, st.keys_mod) else clashes(st.binds, m)
+    return not c or pick(f"⚠ {m} clashes with these binds, which the jump keys would shadow:\n  " + "\n  ".join(c),
+                         [("Cancel", True), (f"Use {m} anyway", True)]) == 1
+
+
+def zellij_change(st, checked=False, **want):
+    """checked: the modifier was confirmed by the caller already"""
     cmds = [[INSTALL] + c for c in zellij_cmds(st, **want)]
+    mod = cmds_mod(cmds)
+    if mod and not checked and not mod_ok(st, mod):
+        return False
     layout = read(st.layout)
     if cmds[0][1:] == ["--uninstall"] and len(cmds) > 1 and layout is not None:
         # --uninstall deletes agents.kdl; put it back so the --layouts-only run after it carries the plugin block's
@@ -399,13 +419,16 @@ def act_default_layout(st):
                           f"(your line stays there as a comment and comes back when the agents' default_layout is "
                           f"turned off or removed)", [("No", True), ("Yes", True)]) != 1:
             return False
+        mod = cmds_mod(zellij_cmds(st, dl=True))
+        if mod and not mod_ok(st, mod):  # before config.kdl is touched
+            return False
         if not os.path.exists(st.cfg + ".zam.bak"):
             shutil.copyfile(st.cfg, st.cfg + ".zam.bak")
         src = re.sub(r"^default_layout\s.*$", lambda m: f'{REPLACED}{m.group(0)}\ndefault_layout "agents" {TAG}',
                      read(st.cfg), count=1, flags=re.M)
         with open(st.cfg, "w") as f:
             f.write(src)
-        return zellij_change(st, dl=True)
+        return zellij_change(st, checked=True, dl=True)
     on = st.dl == "agents"
     off = "off: layouts and jump keys only (start with: zellij --layout agents)"
     if on and not st.dl_tagged:
@@ -422,7 +445,7 @@ def act_keys(st):
     for m in [st.detected] + MODS:
         if m and norm(m + " x") not in [norm(c + " x") for c in cands]:
             cands.append(m)
-    same = lambda a, b: bool(a and b) and norm(a + " x") == norm(b + " x")
+    same = same_mod
     items = []
     for m in cands:
         c = clashes(st.binds, m)
@@ -438,11 +461,7 @@ def act_keys(st):
     m = cands[i]
     if same(m, st.keys_mod):
         return False
-    c = clashes(st.binds, m)
-    if c and pick(f"⚠ {m} clashes with these binds, which the jump keys would shadow:\n  " + "\n  ".join(c),
-                  [("Cancel", True), (f"Use {m} anyway", True)]) != 1:
-        return False
-    return zellij_change(st, mod=m)
+    return zellij_change(st, mod=m)  # confirms m's clashes
 
 
 def set_opt(st, key, value):
