@@ -1,107 +1,158 @@
 # zellij-agents
 
-A Zellij plugin that shows every running coding agent (Claude Code, Cursor CLI, Codex CLI and agy) across tabs, stacks and floating panes, with its status, context usage and age, and jumps to its pane on click/enter.
+See every coding agent you run in Zellij, what it's doing, and jump to it in one key.
 
-One WASM binary, two modes:
+![The agents bar under Zellij's tab bar: three agents, each chip showing its task, status icon, number, repo@branch and context %](docs/images/bar.png)
 
-- **`bar`**: a 2-row strip under the native tab bar. Each chip shows the session title on the first row and, in softer grey below it, the status icon, agent number, repo@branch (the `@branch` in cyan) and context % (green up to 50%, orange above and red above 80%) on the second. Click a chip, or press `Ctrl+Alt+<number>`, to jump; `Ctrl+Alt+←/→` goes to the previous/next agent. The status icon keeps its status colour and only the number and repo are soft grey. The chip of the focused agent uses Zellij's active-tab colours (reverse video only as a fallback) with a bold icon and drops the grey, cyan and ctx colours except a red ctx; a pulsing chip drops all of them, ctx included, since red on amber is unreadable; `↗` marks an agent in another Zellij session. A working agent shows a spinning `◐`; the chip of an agent waiting on you shows `?` and pulses amber until you focus it; after that only the `?` pulses, until it asks something new (needs the hooks below).
-- **`panel`**: a header, a table and a footer, split by thin rules. The header counts the agents (`🤖 Agents 4   ⏳ 1 need you   ⚡ 2 working   💤 1 idle`) and has one line per vendor with the account usage: `📊 Claude  credits $513.35 / $750.00 · ⣿⣿⣿⣀⣀ 68% · resets Dec 1` (usage-based plans; the two amounts in magenta) or `📊 Claude  5h ⣿⣿⣀⣀⣀ 48% · resets 2h10m   week ⣿⣀⣀⣀⣀ 23% · resets Mon` (subscriptions), each meter a row of 5 braille cells that fill by pairs of dots, bottom row to top row (⣀ ⣤ ⣶ ⣿, 4 steps per cell, so each step is 5%), followed by a dim ⣀ track for the cells not yet reached (the trailing ⣀ in the examples, which plain text can't show dimmed), the lit part and % turning yellow from 60 and red from 80; `usage n/a (login expired)` when it can't be fetched. The table has one line per agent: `#` (the agent number), `STATUS` (icon + label), `FOR` (time in that status), `TAB` (tab name in light grey, `↗session` for another Zellij session), `WHERE` (repo@branch, the `@branch` in cyan), `TASK` (session title, plus the current tool), `MODEL` (lavender), `CTX` (context meter, on the same dim ⣀ track, and %, green up to 50%, orange above and red above 80%, or the uncoloured raw token count when the % is unknown) and `COST` (the session's `$` so far in magenta, `-` until known; needs the status line wrapper below). Columns are as wide as their content (WHERE, TAB and MODEL capped), TASK is as wide as its text up to the width left over (spare width goes at the end of the line) and is dropped when the pane is too narrow, after which WHERE, TAB and MODEL narrow (down to 8 cells) before anything is cut off; below about 70 columns trailing columns may still be cut. The footer lists the keys (or shows an error, which keeps the last line even when the pane is too short for the footer): `j/k` or `↑/↓` select, `enter`/click jump, `n` jump to the next agent waiting on you, `q`/`esc` close. Clicking the bar's header block (` AGENTS N `) or `Ctrl+Alt+0` toggles it as a floating pane right below the bar, or bind a key yourself (below).
+## Supported agents
 
-## How detection works
+| agent | works out of the box | the optional integration adds |
+|---|---|---|
+| Claude Code | yes | waiting-on-you state, current tool, cost, "needs you" notifications |
+| Cursor CLI | yes | exact working/idle, current tool, context % (Cursor never shows waiting-on-you) |
+| Codex CLI | yes | waiting-on-you state, current tool, "needs you" notifications (Codex reports no cost) |
+| agy (Antigravity CLI) | yes | exact working/idle, waiting-on-you state, title, model, context %, cost, usage line, notifications |
 
-No setup is needed for the basics. `scripts/zam-scan.py` (run by the plugin every 2s via `run_command`):
+`./setup.sh` detects which agents you have and offers their integrations.
 
-1. reads `~/.claude/sessions/<pid>.json` (Claude Code writes `status` = `busy`/`idle`/`shell`, `cwd`, `name`, `startedAt`),
-2. drops dead processes (checks `/proc/<pid>/stat` start time against `procStart` to survive pid reuse),
-3. reads `ZELLIJ_PANE_ID` from `/proc/<pid>/environ` and finds the agent's session by walking up to the Zellij server process it runs under (that is the jump target). `ZELLIJ_SESSION_NAME` in the environment is frozen at start and goes stale when a session is renamed; the current name is the server's socket file name, matched to the server pid via `SO_PEERCRED` once a rename is detected,
-4. computes context usage like Claude Code does: tokens of the last request (`input + cache_read + cache_creation` from the transcript) divided by that model's `max_input_tokens` from Claude Code's own model catalog cache (`~/.claude/cache/model-catalog/`), rounded and clamped to 0–100, which is the same formula Claude Code uses for the statusline's `used_percentage` (honours `CLAUDE_CODE_MAX_CONTEXT_TOKENS` + `DISABLE_COMPACT` from the agent's env). No Claude settings or statusline needed. If a model isn't in the catalog, the raw token count is shown instead of a guessed %.
+## Features
 
-The plugin joins this with `PaneUpdate`/`TabUpdate` to learn the tab and the pane title (Claude puts the task summary there), and jumps with `focus_terminal_pane` (switches tab, unstacks, shows floating). Agents in another Zellij session are listed with `↗ session` and jump via `switch_session_with_focus`.
+- A bar under the tab bar, on every tab, with one chip per agent.
+- Status per agent: working, waiting on you or idle, with its context %.
+- Click a chip or press `Ctrl+Alt+1…9` to jump to that agent's pane; `Ctrl+Alt+←/→` goes to the previous/next one.
+- A panel (`Ctrl+Alt+0` or click `AGENTS`) with each agent's model, context and cost, and your account's usage limits.
+- Agents in your other Zellij sessions show up too, and you can jump to them.
+- A desktop notification when an agent needs you or finishes.
 
-Optional hooks (`scripts/install-hooks.sh`) add the **NEEDS YOU** state (permission prompt) and the current tool name, which the session file alone can't tell apart from "busy". The same script wraps Claude Code's status line (`statusLine.command` in `~/.claude/settings.json`) with `zam-scan.py --claude-statusline`, which records each session's cost (`cost.total_cost_usd`) in `~/.cache/zellij-agents/claude/<session>.status.json` for the panel's COST column. Your status line keeps working: your previous command is preserved after `--`, gets the same input and its output is still shown. If you had none, the installed one prints nothing. Re-running the script is safe; it keeps a `settings.json.zam.bak` backup of the original, and `--uninstall` undoes it.
+![The agents panel: agent counts, the Claude 5h and weekly usage line, and a table with status, time, tab, repo@branch, task, model, context and cost per agent](docs/images/panel.png)
 
-The panel's usage line comes from the same endpoint Claude Code's `/usage` reads (`api.anthropic.com/api/oauth/usage`), called with your local Claude login (`~/.claude/.credentials.json`). The scanner refreshes it in the background at most once a minute into `~/.cache/zellij-agents/usage/claude.json`, so a scan never waits on the network; the token is only sent in the request, never stored or logged. The endpoint is undocumented: if it changes, the line shows `usage n/a` until the scanner is adapted. An expired login shows `usage n/a (login expired)` until Claude Code refreshes it.
+## Install
 
-### Cursor
+Needs Zellij 0.45 or newer and `python3` (plus `jq` for the agent integrations). Rust is not needed.
 
-Cursor CLI (`cursor-agent`) writes no live session file, so the scanner finds its processes in `/proc` (cmdline contains `cursor-agent/versions/…/index.js`) and follows the `~/.cursor/chats/<hash>/<agentId>/store.db` each one keeps open to the chat's `meta.json` (cwd) and the `store.db` meta row (agent id, name, last model). Pane and session come from the environment as for Claude. Without setup, an agent counts as busy while its `store.db` was written in the last 4 s.
+1. Clone the repo:
+   ```sh
+   git clone https://github.com/Scarfsail/zellij-agents-manager.git && cd zellij-agents-manager
+   ```
+2. Run the setup and pick what you want with ↑/↓ and enter. It detects your agents and offers their integrations.
+   ```sh
+   ./setup.sh
+   ```
+3. Start a new Zellij session. The bar asks for permissions: click it and press `y`.
 
-`scripts/install-cursor.sh` (idempotent, `.zam.bak` backups, `--uninstall` to undo; restart running agents afterwards) wires the scanner into Cursor:
+Re-run `./setup.sh` any time to change or remove things; `./setup.sh --status` shows what is installed.
 
-- **hooks** in `~/.cursor/hooks.json` (`beforeSubmitPrompt`, `preToolUse`, `postToolUse`, `postToolUseFailure`, `stop`, `sessionEnd` → `zam-scan.py --cursor-hook`) give exact busy/idle and the current tool. Existing hooks are kept.
-- **status line** in `~/.cursor/cli-config.json` (`zam-scan.py --cursor-statusline`) records Cursor's own context %. If you already have a status line command, it is chained: it gets the same input and its output is still shown. If you had none, the installed one prints nothing and Cursor's status line area stays blank: it only records context and chains to a previous command.
+Tip: `Ctrl+Alt+<digit>` needs a terminal with the kitty keyboard protocol (WezTerm: `config.enable_kitty_keyboard = true`; kitty, foot, ghostty and recent Alacritty do it by default).
 
-Both write `~/.cache/zellij-agents/cursor/<agent pid>.json`; the hook/status line process finds its agent by walking up its parent processes. Cursor has no permission-prompt hook, so a Cursor agent never shows **NEEDS YOU**.
-
-### Codex
-
-Codex CLI writes no live session file either. The scanner finds its TUI processes in `/proc` (the native `codex` binary, not the `node` wrapper; non-interactive subcommands such as `exec` and the shared `app-server` daemon are skipped) and links each one to the newest interactive thread (`originator` `codex-tui`, not a subagent's) in `~/.codex/state_5.sqlite` with the same working directory that was updated since the process started. The thread gives the title, repo branch and model; the tail of its rollout log (`~/.codex/sessions/…/rollout-*.jsonl`) gives exact busy/idle (`task_started` → busy, `task_complete` or Esc's `turn_aborted` → idle) and the context %, computed like Codex's own "context left" (the last request's tokens over the model's window, both less Codex's 12 000-token baseline). A freshly started TUI has no thread until its first prompt and is listed idle. Two Codex TUIs in the same directory may both show the newer thread: the process carries nothing that names its thread. Pane and session come from the environment as for Claude. Codex logs no cost, so COST stays `-`.
-
-The panel's `📊 Codex` usage line shows the account's 5h and weekly limits from the `rate_limits` Codex logs with each response in the newest rollout, so it needs no login token and no network call. A window whose reset has passed is dropped until Codex logs fresh numbers.
-
-`scripts/install-codex.sh` (idempotent, `.zam.bak` backup, `--uninstall` to undo, existing hooks are kept) adds hooks to `~/.codex/hooks.json` (`UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, `Stop`, `SessionEnd` → `zam-scan.py --codex-hook`), which add **NEEDS YOU** while Codex waits for your approval and the current tool. Codex only runs a hook you have trusted: open `/hooks` in Codex once after installing and trust them, then restart running agents. The hooks run in Codex's shared app-server daemon rather than under the TUI, so they record the thread (`~/.cache/zellij-agents/codex/<thread id>.json`), not a process.
-
-### agy
-
-agy (Antigravity CLI) writes no readable live state: its conversations are protobuf blobs in `~/.gemini/antigravity-cli/conversations/<id>.db`. The scanner finds its TUI processes in `/proc` (the `agy` binary, or `agy.<n>.old` after agy updated itself while running; subcommands such as `mcp` or `models`, print mode `-p`/`--print`/`--prompt` and the `--bg-updater` it starts are skipped). The working directory comes from the process, its branch from the repo's `.git/HEAD`, and pane and session from the environment as for Claude. Without setup, an agent counts as busy while the conversation db it keeps open (or its `-wal`) was written in the last 4 s, and it has no title (the pane title is shown), model, context or cost.
-
-`scripts/install-agy.sh` (idempotent, `.zam.bak` backup, `--uninstall` to undo; restart running agents afterwards) wraps the status line (`statusLine.command` in `~/.gemini/antigravity-cli/settings.json`) with `zam-scan.py --agy-statusline`. agy feeds it a documented JSON whenever its state changes, which gives exact busy/idle (`working`/`tool_use` → busy; `reviewing`, where a plan waits for your review, → idle), **NEEDS YOU** while a tool confirmation dialog is open, the conversation title, model, context %, COST (agy's own estimate) and the `📊 Agy` usage line: one meter per quota bucket as in agy's `/usage` (`gemini 5h`, `gemini week`, `argon week`, `3p 5h`, `3p week`, where `3p` is the Claude and GPT group; a disabled bucket is left out), from `~/.cache/zellij-agents/usage/agy.json`, which is dropped after a day without agy. If you already have a status line command, it is chained: it gets the same input and its output is still shown. If you had none, the installed one is stacked below agy's built-in status line (`stack_with_default`), which keeps showing. The status line process finds its agent by walking up its parent processes and writes `~/.cache/zellij-agents/agy/<agent pid>.json`. COST, NEEDS YOU, the usage line and notifications need the status line.
-
-## Notifications
-
-The bar also raises a system notification when an agent enters **NEEDS YOU** (`Claude needs you` / `Codex needs you` / `Agy needs you`, which need the hooks from `scripts/install-hooks.sh` / `scripts/install-codex.sh` or the status line from `scripts/install-agy.sh`) or finishes its turn (busy or NEEDS YOU → idle, `Claude finished` / `Cursor finished` / `Codex finished` / `Agy finished`), naming repo@branch and the task. The scanner detects the transition and records it in `~/.cache/zellij-agents/notify/`, so bars in several tabs and sessions notify once, and agents that were already waiting or idle when the bars started don't notify at all. Under WSL it shows a Windows toast via `powershell.exe`, skipped while the terminal is the foreground window (recognised: WezTerm via `TERM_PROGRAM`, Windows Terminal via `WT_SESSION`; any other terminal always notifies). The terminal is read from the environment the Zellij server was started in, so a session attached later from a different terminal, or started detached, isn't suppressed correctly. On Linux it runs `notify-send`, which always notifies, since there is no portable way to tell whether the terminal is focused. Set `notify false` in the bar's plugin config to turn it off.
-
-## Build
-
-```sh
-plugin/build.sh     # -> dist/zellij-agents.wasm
-```
-
-The plugin source (Rust crate) lives in `plugin/`; the built `dist/zellij-agents.wasm` is committed. Needs rustup + `wasm32-wasip1`. Without a system C compiler it uses zig from `~/.local/share/zam-zig` as the host linker (`sudo apt install build-essential` removes the need).
-
-## Install (bar in every new session)
-
-### Setup
-
-```sh
-./setup.sh           # status of Zellij and every detected agent; install, change or remove any of it
-./setup.sh --status  # the same overview as plain text, no menu
-```
-
-`setup.sh` opens on one screen in four groups: **Requirements** (Zellij and its version, `jq`, the plugin build), **Zellij integration** (the layouts, `default_layout`, the jump keys and their modifier), **Bar options** (`notify` / `interval` / `hide_on_jump`) and **Supported agents** (Claude, Cursor, Codex, agy: the hooks and status line of each, and below them where its binary is, its version and its config directory; an agent is found when the binary is on `PATH` or its config directory exists, the others are listed as "not found"). Settings show their value in `[brackets]` followed by `›`; the other lines are information and the cursor skips them. ✓ marks what is installed or on, ⚠ a warning (stale, a key clash, Zellij too old), ✗ a missing requirement and ○ off or not installed. Pick a setting with ↑/↓ (or j/k) and enter to install, update, change or remove it; q or esc goes back. `--status` prints the same groups, colored only on a terminal and without `NO_COLOR`. Re-run it to change a preference; changing nothing changes no file. Everything it shows is read back from `config.kdl`, `agents.kdl` and the agents' settings files, so manual edits and runs of the scripts below show up too, and anything that points at a different checkout is marked "stale".
-
-The jump-key modifier defaults to the one your Zellij mode keys use (the modifier on `SwitchToMode "pane"`: `Ctrl` in stock Zellij); a modifier whose jump keys would shadow an existing bind in normal or locked mode is marked ⚠ with those binds, and asks before it is used. It needs `python3`, and `zellij` and `jq` for the actions that use them. The changes themselves are made by the scripts below, which stay the non-interactive way to do the same.
-
-### By hand
-
-`setup.sh` drives these scripts, so they stay the non-interactive way: `scripts/install.sh` for Zellij (below) and `scripts/install-hooks.sh`, `scripts/install-cursor.sh`, `scripts/install-codex.sh`, `scripts/install-agy.sh` for the agents.
-
-```sh
-scripts/install.sh                     # layouts/agents.kdl + agents.swap.kdl in ~/.config/zellij/layouts, default_layout "agents" and jump keys in config.kdl
-scripts/install.sh --mod "Alt"         # jump keys on another modifier (default "Ctrl Alt")
-scripts/install.sh --opt notify=false  # a line in the bar's plugin config (repeatable; key= removes it)
-scripts/install.sh --no-default-layout # layouts + jump keys; removes our default_layout "agents" line
-scripts/install.sh --layouts-only      # only the layouts; config.kdl untouched
-scripts/install.sh --uninstall         # undo
-```
-
-Plugin options already in `agents.kdl` (`notify false`, or any you added by hand) are carried over when `scripts/install.sh` regenerates the layouts, so a plain re-run keeps them; `--opt` sets or removes one on top.
-
-On another machine: clone the repo anywhere, run `./setup.sh`, start a new session. Needs Zellij 0.45 and `python3`; the built `dist/zellij-agents.wasm` is committed, so Rust is only needed to change the plugin. If there is no `config.kdl` yet, one is created holding only the jump keys (Zellij's defaults stay in effect). If `config.kdl` already sets another `default_layout`, the script installs the keys and layouts and asks you to switch the layout yourself. `./setup.sh` can switch it for you: your line stays in `config.kdl` as a `// zellij-agents replaced: …` comment, and `--uninstall` / `--no-default-layout` put it back.
-
-On first start the bar asks for permissions (read state, change state, run commands, open panes for the panel under the bar): click it and press `y`. Zellij remembers this per plugin path; bars that were already open in other tabs ask once too.
-
-The layout is generated from zellij's own default layout and swap layouts, with the bar added under the tab bar. It points at this checkout, so `plugin/build.sh` updates new sessions directly. Existing sessions keep their layout; start a new session (or `zellij action new-tab --layout agents`) to get the bar.
-
-## Jump keys
-
-`scripts/install.sh` adds these to `config.kdl` (lines tagged `// zellij-agents`; re-running replaces them, `--uninstall` removes them). `Ctrl+Alt` is the default modifier; `--mod` or `./setup.sh` picks another:
+## Usage
 
 | key | action |
 |---|---|
 | `Ctrl+Alt+1` … `Ctrl+Alt+9` | jump to agent n of the bar |
-| `Ctrl+Alt+0` | toggle the agents panel (same as clicking the bar's header) |
-| `Ctrl+Alt+←` / `Ctrl+Alt+→` | previous / next agent from the focused one, wrapping around at both ends |
+| `Ctrl+Alt+0` | toggle the agents panel (same as clicking `AGENTS`) |
+| `Ctrl+Alt+←` / `Ctrl+Alt+→` | previous / next agent, wrapping around |
+| panel: `j`/`k` or `↑`/`↓` | select |
+| panel: `enter` or click | jump |
+| panel: `n` | jump to the next agent waiting on you |
+| panel: `q` or `esc` | close |
+
+Keys are shown with the `Ctrl+Alt` modifier. `./setup.sh` suggests the one your Zellij mode keys already use and lets you pick another.
+
+## Uninstall
+
+Run `./setup.sh` and choose Remove on the layouts and on each agent, or by hand: `scripts/install.sh --uninstall` and each agent script's `--uninstall` (see [Development](#development)).
+
+---
+
+## How it works
+
+One WASM binary (`dist/zellij-agents.wasm`, committed) runs in two modes: `bar` and `panel`.
+
+### Bar
+
+A 2-row strip under the native tab bar. The block on the left (` AGENTS N `) counts the agents by status and toggles the panel. Each chip shows the session title on the first row and, in softer grey below it, the status icon, agent number, repo@branch (the `@branch` in cyan) and context % (green up to 50%, orange above and red above 80%). The status icon keeps its status colour.
+
+- A working agent shows a spinning `◐`. An agent waiting on you shows `?` and its chip pulses amber until you focus it; after that only the `?` pulses, until it asks something new (needs the integration).
+- The focused agent's chip uses Zellij's active-tab colours (reverse video only as a fallback) with a bold icon, and drops the grey, cyan and ctx colours except a red ctx. A pulsing chip drops all of them, ctx included, since red on amber is unreadable.
+- `↗` marks an agent in another Zellij session.
+
+### Panel
+
+A header, a table and a footer, split by thin rules.
+
+- **Header**: the agent counts (`🤖 Agents 4   ⏳ 1 need you   ⚡ 2 working   💤 1 idle`) and one usage line per vendor, either `📊 Claude  credits $513.35 / $750.00 · ⣿⣿⣿⣀⣀ 68% · resets Dec 1` (usage-based plans, the amounts in magenta) or `📊 Claude  5h ⣿⣿⣀⣀⣀ 48% · resets 2h10m   week ⣿⣀⣀⣀⣀ 23% · resets Mon` (subscriptions); `usage n/a (login expired)` when it can't be fetched.
+- **Meters** are 5 braille cells that fill by pairs of dots, bottom to top (⣀ ⣤ ⣶ ⣿, 4 steps per cell, so 5% per step), on a dim ⣀ track for the cells not reached yet. A usage meter and its % turn yellow from 60 and red from 80.
+- **Table**, one line per agent: `#` (agent number), `STATUS` (icon + label), `FOR` (time in that status), `TAB` (tab name in light grey, `↗session` for another Zellij session), `WHERE` (repo@branch, `@branch` in cyan), `TASK` (session title plus the current tool), `MODEL` (lavender), `CTX` (meter and %, coloured as on the bar, or the uncoloured raw token count when the % is unknown) and `COST` (the session's `$` so far in magenta, `-` until known).
+- **Layout**: columns are as wide as their content (WHERE, TAB and MODEL capped). TASK takes the width left over and is dropped when the pane is too narrow; after that WHERE, TAB and MODEL narrow down to 8 cells before anything is cut. Below about 70 columns trailing columns may still be cut.
+- **Footer**: the keys, or an error, which keeps the last line even when the pane is too short for the footer.
+
+The bar opens the panel as its own pinned floating pane right below itself, full width and sized to the agents, with the bar's config and `mode=panel`. Other floating panes of the tab are tucked away while it is open and come back when it closes. The panel starts with the selection on the agent you were focused on.
+
+### How detection works
+
+The plugin runs `scripts/zam-scan.py` every 2 s via `run_command`. For Claude Code it:
+
+1. reads `~/.claude/sessions/<pid>.json` (Claude Code writes `status` = `busy`/`idle`/`shell`, `cwd`, `name`, `startedAt`),
+2. drops dead processes (checks `/proc/<pid>/stat` start time against `procStart` to survive pid reuse),
+3. reads `ZELLIJ_PANE_ID` from `/proc/<pid>/environ` and finds the agent's session by walking up to the Zellij server process it runs under (the jump target). `ZELLIJ_SESSION_NAME` is frozen at start and goes stale when a session is renamed; the current name is the server's socket file name, matched to the server pid via `SO_PEERCRED` once a rename is detected,
+4. computes context usage the way Claude Code does for the statusline's `used_percentage`: tokens of the last request (`input + cache_read + cache_creation` from the transcript) over that model's `max_input_tokens` from Claude Code's model catalog cache (`~/.claude/cache/model-catalog/`), rounded and clamped to 0–100, honouring `CLAUDE_CODE_MAX_CONTEXT_TOKENS` + `DISABLE_COMPACT` from the agent's env. If a model isn't in the catalog, the raw token count is shown instead of a guessed %.
+
+The plugin joins this with `PaneUpdate`/`TabUpdate` to learn the tab and the pane title (Claude puts the task summary there), and jumps with `focus_terminal_pane` (switches tab, unstacks, shows floating). Agents in another Zellij session jump via `switch_session_with_focus`.
+
+**Claude integration** (`scripts/install-hooks.sh`): hooks add the NEEDS YOU state (permission prompt) and the current tool, which the session file alone can't tell apart from busy. The script also wraps Claude Code's status line (`statusLine.command` in `~/.claude/settings.json`) with `zam-scan.py --claude-statusline`, which records each session's cost (`cost.total_cost_usd`) in `~/.cache/zellij-agents/claude/<session>.status.json` for the COST column. Your previous status line command is kept after `--`, gets the same input and its output is still shown; if you had none, the installed one prints nothing. Re-running is safe; it keeps a `settings.json.zam.bak` backup and `--uninstall` undoes it.
+
+**Claude usage line**: from the endpoint Claude Code's `/usage` reads (`api.anthropic.com/api/oauth/usage`), called with your local Claude login (`~/.claude/.credentials.json`). The scanner refreshes it in the background at most once a minute into `~/.cache/zellij-agents/usage/claude.json`, so a scan never waits on the network; the token is only sent in the request, never stored or logged. The endpoint is undocumented: if it changes, the line shows `usage n/a` until the scanner is adapted. An expired login shows `usage n/a (login expired)` until Claude Code refreshes it.
+
+All agent install scripts are idempotent, keep `.zam.bak` backups, keep your existing hooks and undo with `--uninstall`. Restart running agents after installing. Pane and session always come from the agent's environment, as for Claude.
+
+### Cursor
+
+Cursor CLI (`cursor-agent`) writes no live session file, so the scanner finds its processes in `/proc` (cmdline contains `cursor-agent/versions/…/index.js`) and follows the `~/.cursor/chats/<hash>/<agentId>/store.db` each one keeps open to the chat's `meta.json` (cwd) and the `store.db` meta row (agent id, name, last model). Without setup, an agent counts as busy while its `store.db` was written in the last 4 s.
+
+`scripts/install-cursor.sh` adds:
+
+- **hooks** in `~/.cursor/hooks.json` (`beforeSubmitPrompt`, `preToolUse`, `postToolUse`, `postToolUseFailure`, `stop`, `sessionEnd` → `zam-scan.py --cursor-hook`): exact busy/idle and the current tool.
+- **status line** in `~/.cursor/cli-config.json` (`zam-scan.py --cursor-statusline`): records Cursor's own context %. An existing status line command is chained (same input, output still shown); if you had none, Cursor's status line area stays blank.
+
+Both write `~/.cache/zellij-agents/cursor/<agent pid>.json`; the hook/status line process finds its agent by walking up its parent processes. Cursor has no permission-prompt hook, so a Cursor agent never shows NEEDS YOU.
+
+### Codex
+
+Codex CLI writes no live session file either. The scanner finds its TUI processes in `/proc` (the native `codex` binary, not the `node` wrapper; non-interactive subcommands such as `exec` and the shared `app-server` daemon are skipped) and links each one to the newest interactive thread (`originator` `codex-tui`, not a subagent's) in `~/.codex/state_5.sqlite` with the same working directory, updated since the process started. The thread gives the title, branch and model; the tail of its rollout log (`~/.codex/sessions/…/rollout-*.jsonl`) gives exact busy/idle (`task_started` → busy, `task_complete` or Esc's `turn_aborted` → idle) and the context %, computed like Codex's own "context left" (the last request's tokens over the model's window, both less Codex's 12 000-token baseline). A freshly started TUI has no thread until its first prompt and is listed idle. Two Codex TUIs in the same directory may both show the newer thread: the process carries nothing that names its thread. Codex logs no cost, so COST stays `-`.
+
+The `📊 Codex` usage line shows the 5h and weekly limits from the `rate_limits` Codex logs with each response in the newest rollout, so it needs no login token and no network call. A window whose reset has passed is dropped until Codex logs fresh numbers.
+
+`scripts/install-codex.sh` adds hooks to `~/.codex/hooks.json` (`UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, `Stop`, `SessionEnd` → `zam-scan.py --codex-hook`): NEEDS YOU while Codex waits for your approval, and the current tool. Codex only runs hooks you trust: open `/hooks` in Codex once after installing and trust them, then restart running agents. The hooks run in Codex's shared app-server daemon rather than under the TUI, so they record the thread (`~/.cache/zellij-agents/codex/<thread id>.json`), not a process.
+
+### agy
+
+agy (Antigravity CLI) writes no readable live state: its conversations are protobuf blobs in `~/.gemini/antigravity-cli/conversations/<id>.db`. The scanner finds its TUI processes in `/proc` (the `agy` binary, or `agy.<n>.old` after agy updated itself while running; subcommands such as `mcp` or `models`, print mode `-p`/`--print`/`--prompt` and the `--bg-updater` it starts are skipped). The working directory comes from the process and its branch from the repo's `.git/HEAD`. Without setup, an agent counts as busy while the conversation db it keeps open (or its `-wal`) was written in the last 4 s, and it has no title (the pane title is shown), model, context or cost.
+
+`scripts/install-agy.sh` wraps the status line (`statusLine.command` in `~/.gemini/antigravity-cli/settings.json`) with `zam-scan.py --agy-statusline`. agy feeds it a documented JSON whenever its state changes, which gives:
+
+- exact busy/idle (`working`/`tool_use` → busy; `reviewing`, where a plan waits for your review, → idle),
+- NEEDS YOU while a tool confirmation dialog is open,
+- the conversation title, model, context % and COST (agy's own estimate),
+- the `📊 Agy` usage line: one meter per quota bucket as in agy's `/usage` (`gemini 5h`, `gemini week`, `argon week`, `3p 5h`, `3p week`, where `3p` is the Claude and GPT group; a disabled bucket is left out), from `~/.cache/zellij-agents/usage/agy.json`, dropped after a day without agy.
+
+An existing status line command is chained (same input, output still shown); if you had none, the installed one is stacked below agy's built-in status line (`stack_with_default`), which keeps showing. The status line process finds its agent by walking up its parent processes and writes `~/.cache/zellij-agents/agy/<agent pid>.json`. COST, NEEDS YOU, the usage line and notifications need the status line.
+
+### Notifications
+
+The bar raises a system notification when an agent enters NEEDS YOU (`Claude needs you` / `Codex needs you` / `Agy needs you`, which need the integration) or finishes its turn (busy or NEEDS YOU → idle: `Claude finished` / `Cursor finished` / `Codex finished` / `Agy finished`), naming repo@branch and the task. The scanner detects the transition and records it in `~/.cache/zellij-agents/notify/`, so bars in several tabs and sessions notify once, and agents that were already waiting or idle when the bars started don't notify at all.
+
+- **WSL**: a Windows toast via `powershell.exe`, skipped while the terminal is the foreground window (recognised: WezTerm via `TERM_PROGRAM`, Windows Terminal via `WT_SESSION`; any other terminal always notifies). The terminal is read from the environment the Zellij server was started in, so a session attached later from a different terminal, or started detached, isn't suppressed correctly.
+- **Linux**: `notify-send`, which always notifies, since there is no portable way to tell whether the terminal is focused.
+
+Set `notify false` in the bar's plugin config to turn it off.
+
+### Layout and jump keys
+
+`scripts/install.sh` generates `~/.config/zellij/layouts/agents.kdl` + `agents.swap.kdl` from Zellij's own default layout and swap layouts, with the bar added under the tab bar, and sets `default_layout "agents"` in `config.kdl`. The layout points at this checkout, so `plugin/build.sh` updates new sessions directly. Existing sessions keep their layout; start a new session (or `zellij action new-tab --layout agents`) to get the bar. If there is no `config.kdl` yet, one is created holding only the jump keys (Zellij's defaults stay in effect). If `config.kdl` sets another `default_layout`, the script installs the keys and layouts and asks you to switch the layout yourself; `./setup.sh` can switch it for you, keeping your line as a `// zellij-agents replaced: …` comment that `--uninstall` / `--no-default-layout` put back.
+
+On first start the bar asks for permissions (read state, change state, run commands, open panes for the panel under the bar). Zellij remembers this per plugin path; bars already open in other tabs ask once too.
+
+The jump keys are lines tagged `// zellij-agents` in `config.kdl` (re-running replaces them, `--uninstall` removes them). `scripts/install.sh` defaults to `Ctrl Alt`; `./setup.sh` defaults to the modifier your Zellij mode keys use (the one on `SwitchToMode "pane"` in normal mode: `Ctrl` in stock Zellij), falling back to `Ctrl Alt` when it finds none. `./setup.sh` marks a modifier whose jump keys would shadow an existing bind in normal or locked mode with ⚠ and asks before using it. Legacy terminal encoding can't express Ctrl with a digit, hence the kitty keyboard protocol.
 
 Each key broadcasts a message to all plugins:
 
@@ -109,11 +160,42 @@ Each key broadcasts a message to all plugins:
 bind "Ctrl Alt 1" { MessagePlugin { name "zam_jump"; payload "1"; }; }
 ```
 
-Only the bar in the tab you are looking at acts on it, so one press is one jump. Payloads: `1`–`9`, `left`, `right`, `panel` (toggle the agents panel), and `next` (next agent waiting on you, then the next idle one; no default key, bind it yourself if you want one). Numbers follow the bar order: agents in this session by tab, top-to-bottom and left-to-right within a tab, then agents in other sessions.
+Only the bar in the tab you are looking at acts on it, so one press is one jump. Payloads: `1`–`9`, `left`, `right`, `panel` (toggle the panel), and `next` (next agent waiting on you, then the next idle one; no default key). Numbers follow the bar order: agents in this session by tab, top-to-bottom and left-to-right within a tab, then agents in other sessions.
 
-`Ctrl+Alt+<digit>` needs a terminal that speaks the kitty keyboard protocol (WezTerm: `config.enable_kitty_keyboard = true`; kitty, foot, ghostty and recent Alacritty do by default). Legacy terminal encoding can't express Ctrl with a digit.
+A key of your own for the panel should go through the bar with the `panel` payload, since only the bar knows which agent you were focused on (add to the `shared_except "locked"` block of `config.kdl`):
 
-Zellij reloads `config.kdl` in running sessions by itself. To load a new plugin build into bars that are already running:
+```kdl
+bind "Alt a" { MessagePlugin { name "zam_jump"; payload "panel"; }; }
+```
+
+### Setup screen
+
+`./setup.sh` shows four groups: **Requirements** (Zellij and its version, `jq`, the plugin build), **Zellij integration** (the layouts, `default_layout`, the jump keys and their modifier), **Bar options** (`notify` / `interval` / `hide_on_jump`) and **Supported agents** (the hooks and status line of each, plus its binary, version and config directory; an agent is found when its binary is on `PATH` or its config directory exists, the others are "not found"). Settings show their value in `[brackets]` followed by `›`; the cursor skips information lines. ✓ marks what is installed or on, ⚠ a warning (stale, a key clash, Zellij too old), ✗ a missing requirement and ○ off or not installed. ↑/↓ (or j/k) and enter to change a setting; q or esc goes back. `--status` prints the same groups, coloured only on a terminal and without `NO_COLOR`. Changing nothing changes no file. Everything is read back from `config.kdl`, `agents.kdl` and the agents' settings files, so manual edits and runs of the scripts show up too, and anything pointing at a different checkout is marked "stale". The changes themselves are made by the scripts under [Development](#development).
+
+### Config
+
+Plugin options, set in the bar's plugin block in `agents.kdl` (via `./setup.sh` or `scripts/install.sh --opt`):
+
+| key | default | |
+|---|---|---|
+| `mode` | `bar` | `bar` or `panel` |
+| `scanner` | `zam-scan.py` | absolute path, or `~/…` |
+| `interval` | `2` | seconds between scans |
+| `hide_on_jump` | `true` | panel closes itself after jumping |
+| `notify` | `true` | bar: system notification when an agent needs you or finishes (see *Notifications*) |
+| `debug_dump` | – | write each rendered frame to this path |
+
+## Development
+
+### Build
+
+```sh
+plugin/build.sh     # -> dist/zellij-agents.wasm
+```
+
+The plugin source (Rust crate) lives in `plugin/`; the built `dist/zellij-agents.wasm` is committed. Needs rustup + `wasm32-wasip1`. Without a system C compiler it uses zig from `~/.local/share/zam-zig` as the host linker (`sudo apt install build-essential` removes the need).
+
+Zellij reloads `config.kdl` in running sessions by itself. To load a new build into bars that are already running:
 
 ```sh
 # run from the checkout; must match the bar config scripts/install.sh wrote into the layout
@@ -122,7 +204,7 @@ zellij action start-or-reload-plugin -c "mode=bar,scanner=$PWD/scripts/zam-scan.
 
 The configuration must match the layout's exactly, or Zellij starts a new instance instead.
 
-## Try it
+### Try it without installing
 
 Bar in every tab (new session with this layout):
 
@@ -138,21 +220,25 @@ Panel as a floating window in the current session:
 zellij plugin --floating --configuration "mode=panel,scanner=$PWD/scripts/zam-scan.py" -- "file:$PWD/dist/zellij-agents.wasm"
 ```
 
-Zellij asks for permissions on first load (read state, change state, run commands, open panes for the panel under the bar); press `y`.
+Zellij asks for permissions on first load; press `y`.
 
-Clicking the bar's header (or `Ctrl+Alt+0`) toggles the panel without any setup: the bar opens its own pinned floating panel right below itself, full width and sized to the agents, with the bar's config and `mode=panel`. Other floating windows of the tab are tucked away while it is open and come back when it closes. The panel starts with the selection on the agent you were focused on, which only the bar knows, so a keybinding of your own for the panel should go through the bar with the `panel` payload (add to the `shared_except "locked"` block of `config.kdl`):
+### Install by hand
 
-```kdl
-bind "Alt a" { MessagePlugin { name "zam_jump"; payload "panel"; }; }
+`setup.sh` drives these scripts, which stay the non-interactive way to do the same: `scripts/install.sh` for Zellij and `scripts/install-hooks.sh` (Claude), `scripts/install-cursor.sh`, `scripts/install-codex.sh`, `scripts/install-agy.sh` for the agents (each takes `--uninstall`).
+
+```sh
+scripts/install.sh                     # layouts/agents.kdl + agents.swap.kdl in ~/.config/zellij/layouts, default_layout "agents" and jump keys in config.kdl
+scripts/install.sh --mod "Alt"         # jump keys on another modifier (default "Ctrl Alt")
+scripts/install.sh --opt notify=false  # a line in the bar's plugin config (repeatable; key= removes it)
+scripts/install.sh --no-default-layout # layouts + jump keys; removes our default_layout "agents" line
+scripts/install.sh --layouts-only      # only the layouts; config.kdl untouched
+scripts/install.sh --uninstall         # undo
 ```
 
-## Config
+Plugin options already in `agents.kdl` (`notify false`, or any you added by hand) are carried over when `scripts/install.sh` regenerates the layouts, so a plain re-run keeps them; `--opt` sets or removes one on top.
 
-| key | default | |
-|---|---|---|
-| `mode` | `bar` | `bar` or `panel` |
-| `scanner` | `zam-scan.py` | absolute path, or `~/…` |
-| `interval` | `2` | seconds between scans |
-| `hide_on_jump` | `true` | panel closes itself after jumping |
-| `notify` | `true` | bar: system notification when an agent needs you or finishes (see *Notifications*) |
-| `debug_dump` | – | write each rendered frame to this path |
+### Tests
+
+```sh
+python3 -m unittest discover tests
+```
