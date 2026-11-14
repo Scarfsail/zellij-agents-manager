@@ -622,12 +622,18 @@ def cursor_agents():
     return out
 
 
-# argv[1] of codex runs that are not an interactive TUI (codex-cli 0.167); app-server is the shared daemon
+# the subcommand of codex runs that are not an interactive TUI (codex-cli 0.167); app-server is the shared daemon
 CODEX_NON_TUI = {
     b"exec", b"e", b"review", b"login", b"logout", b"mcp", b"mcp-server", b"plugin", b"app-server",
     b"remote-control", b"completion", b"update", b"doctor", b"sandbox", b"debug", b"apply", b"a", b"queue",
     b"archive", b"delete", b"migrate-rollouts", b"migrate-nfs-db", b"unarchive", b"cloud", b"exec-server",
     b"features", b"help",
+}
+# top-level options whose value is the next arg (codex-cli 0.167 --help); -i/--image takes every arg up to the next option
+CODEX_OPT_VALUE = {
+    b"-c", b"--config", b"--enable", b"--disable", b"--remote", b"--remote-auth-token-env", b"--local-provider",
+    b"-m", b"--model", b"-p", b"--profile", b"-s", b"--sandbox", b"-C", b"--cd", b"--add-dir", b"-a",
+    b"--ask-for-approval",
 }
 CODEX_EVENTS = (b'"task_started"', b'"task_complete"', b'"turn_aborted"', b'"token_count"')
 # Codex's context % leaves out this many tokens of fixed prompt overhead, on both sides
@@ -645,7 +651,19 @@ def is_codex(pid):
     except OSError:
         return False
     # argv[0] is codex for the TUI (the npm wrapper passes the binary's path); helpers re-exec it under their own name
-    return os.path.basename(argv[0]) == b"codex" and (len(argv) < 2 or argv[1] not in CODEX_NON_TUI)
+    if os.path.basename(argv[0]) != b"codex":
+        return False
+    i, image = 1, False
+    while i < len(argv) and argv[i] != b"--":  # the first positional after the options: a subcommand or the prompt
+        a = argv[i]
+        if a.startswith(b"-"):
+            image = a in (b"-i", b"--image")
+            i += 2 if a in CODEX_OPT_VALUE else 1
+        elif image:
+            i += 1
+        else:
+            break
+    return i >= len(argv) or argv[i] not in CODEX_NON_TUI
 
 
 def codex_query(sql, *args):
@@ -689,7 +707,8 @@ def _scan_rollout(lines, info):
 
 def rollout_info(path, thread_id=None):
     """from the rollout's tail only; with thread_id, a last turn event older than the tail (a turn that logged
-    more than TAIL_BYTES) is read from the whole file once and kept in CODEX_DIR/<thread id>.turn.json"""
+    more than TAIL_BYTES) is kept in CODEX_DIR/<thread id>.turn.json with the byte offset read up to, so each
+    scan reads only what the rollout gained since (the whole file the first time)"""
     info = tail_scan(path, _scan_rollout, lambda i: True) if path else {}
     if not (path and thread_id) or "status" in info or os.path.getsize(path) <= TAIL_BYTES:
         return info
@@ -699,15 +718,25 @@ def rollout_info(path, thread_id=None):
             c = json.load(f)
     except (OSError, ValueError):
         c = None
-    if not (isinstance(c, dict) and c.get("rollout") == path):
-        full = {}
+    if not (isinstance(c, dict) and c.get("rollout") == path and isinstance(c.get("offset"), int)):
+        c = {"rollout": path, "offset": 0}
+    try:
         with open(path, "rb") as f:
-            _scan_rollout(reversed(f.read().splitlines()), full)
-        if "status" not in full:
-            return info
-        c = {"rollout": path, "status": full["status"], "status_since": full["status_since"]}
+            off = c["offset"] if c["offset"] <= f.seek(0, 2) else 0
+            f.seek(off)
+            new = f.read()
+    except OSError:
+        return info
+    end = new.rfind(b"\n") + 1  # a line still being written is read next time
+    if end:
+        turn = {}
+        _scan_rollout(reversed(new[:end].splitlines()), turn)
+        if "status" in turn:
+            c.update(status=turn["status"], status_since=turn["status_since"])
+        c["offset"] = off + end
         write_json(cache, c)
-    info.update(status=c.get("status"), status_since=c.get("status_since"))
+    if "status" in c:
+        info.update(status=c["status"], status_since=c["status_since"])
     return info
 
 
