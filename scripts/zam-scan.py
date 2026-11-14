@@ -761,7 +761,10 @@ def codex_hook():
         if h.get("hook_event_name") == "SessionEnd":
             os.remove(path)
         else:
-            write_json(path, {"event": h.get("hook_event_name"), "tool": h.get("tool_name") or "", "ts": int(time.time() * 1000)})
+            ev, now = h.get("hook_event_name"), int(time.time() * 1000)
+            # keep the last request's time: later tool events overwrite the rest
+            asked = now if ev == "PermissionRequest" else codex_state(sid).get("asked_ts", 0)
+            write_json(path, {"event": ev, "tool": h.get("tool_name") or "", "ts": now, "asked_ts": asked})
     except BaseException:
         pass
 
@@ -807,10 +810,12 @@ def codex_agents():
             # a rollout line after the request: approved (or denied), the turn goes on
             if st.get("event") == "PermissionRequest" and hook_ts > status_ts and info.get("last_ts", 0) <= hook_ts:
                 status, status_ts, detail = "needs_input", hook_ts, st.get("tool") or "permission"
-            elif status == "busy" and hook_ts > status_ts:
-                if st.get("event") == "PreToolUse":
+            elif status == "busy":
+                if st.get("event") == "PreToolUse" and hook_ts > status_ts:
                     detail = st.get("tool") or ""
-                status_ts = hook_ts  # busy again after a request, so the next one in this turn is new
+                asked = _int(st.get("asked_ts")) or 0
+                if asked > status_ts:
+                    status_ts = asked + 1  # busy again after a request in this turn, so the next one is new
             a = {
                 "kind": "codex",
                 "pid": pid,
