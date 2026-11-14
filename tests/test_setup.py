@@ -231,6 +231,15 @@ class SetupTest(unittest.TestCase):
         self.assertEqual(self.layout_text().count("interval"), 1)
         self.assertEqual(zs.read_state().opts, {"interval": "3"})
 
+    def test_blank_lines_in_plugin_block(self):
+        self.sh("./install.sh")
+        self.hand_edit_plugin_block(["notify false", "", "   ", "interval 5"])
+        self.assertEqual(zs.read_state().opts, {"notify": "false", "interval": "5"})
+        s = self.status()
+        self.assertEqual((s["notify"], s["interval"]), ("off", "5 s"))
+        self.sh("./install.sh", "--opt", "notify=true")
+        self.assertEqual(zs.read_state().opts, {"notify": "true", "interval": "5"})
+
     def test_non_ascii_opt(self):
         self.sh("./install.sh", "--opt", "debug_dump=/tmp/ž")
         self.assertIn('debug_dump "/tmp/ž"\n', self.layout_text())

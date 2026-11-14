@@ -139,6 +139,8 @@ def plugin_opts(layout_text):
     m = re.search(r'plugin location="file:[^"]*zellij-agents\.wasm" \{\n(.*?)\n\s*\}', layout_text or "", re.S)
     opts = {}
     for line in m.group(1).splitlines() if m else []:
+        if not line.strip():
+            continue
         k, v = (line.split(None, 1) + [""])[:2]  # KDL whitespace: a tab as well as a space
         v = v.strip()
         if k and v and not k.startswith("/") and k not in ("mode", "scanner"):
