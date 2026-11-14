@@ -7,5 +7,5 @@ if ! command -v cc >/dev/null 2>&1 && [ -x "$HOME/.local/share/zam-zig/zigcc" ];
   export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$HOME/.local/share/zam-zig/zigcc" CC="$HOME/.local/share/zam-zig/zigcc"
 fi
 cargo build --release
-mkdir -p dist && cp target/wasm32-wasip1/release/zellij-agents.wasm dist/
+mkdir -p ../dist && cp target/wasm32-wasip1/release/zellij-agents.wasm ../dist/
 echo "built dist/zellij-agents.wasm"
