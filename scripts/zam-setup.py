@@ -2,8 +2,9 @@
 """Interactive setup (run it through ../setup.sh): a status overview of Zellij and every detected agent, from which
 any piece can be installed, changed or removed. Every setting is read back from the files on disk (config.kdl,
 agents.kdl, the agents' settings files); nothing is stored separately. The changes themselves are made by
-install.sh and scripts/install-*.sh, so there is one implementation of each edit.
+scripts/install.sh and scripts/install-*.sh, so there is one implementation of each edit.
   --status  print the overview as plain text and exit"""
+import concurrent.futures
 import curses
 import functools
 import json
@@ -12,11 +13,13 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import unicodedata
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-INSTALL = os.path.join(HERE, "install.sh")
+INSTALL = os.path.join(HERE, "scripts", "install.sh")
 SCAN = os.path.join(HERE, "scripts", "zam-scan.py")
 TAG = "// zellij-agents"
 REPLACED = "// zellij-agents replaced: "  # the user's default_layout line, put back by install.sh with ours removed
@@ -25,6 +28,7 @@ MODS = ["Ctrl Alt", "Alt", "Ctrl Shift", "Super"]
 JUMP_KEYS = [str(n) for n in range(1, 10)] + ["0", "left", "right"]
 STR = re.compile(r'"((?:[^"\\]|\\.)*)"')
 KEEP = object()
+PROBE_TIMEOUT = 2  # seconds a `<tool> --version` may take
 
 
 class State:
@@ -185,25 +189,59 @@ def agents():
     agy = os.path.join(home, ".gemini", "antigravity-cli")
     scan = lambda flag: f"python3 {shq(SCAN)} --{flag}"
     zam = lambda flag: ("zam-scan.py", "--" + flag)
-    return [  # name, binary, config dir, script, [(part, file, markers, our command)]
+    # name, binary, config dir, script, [(part, file, markers, our command)], whether its --version may be run:
+    # cursor-agent's rewrites ~/.cursor/cli-config.json, which holds our status line
+    return [
         ("Claude", "claude", claude, "install-hooks.sh", [
             ("hooks", f"{claude}/settings.json", ("zam-hook.sh",), os.path.join(HERE, "scripts", "zam-hook.sh")),
-            ("status line", f"{claude}/settings.json", zam("claude-statusline"), scan("claude-statusline"))]),
+            ("status line", f"{claude}/settings.json", zam("claude-statusline"), scan("claude-statusline"))], True),
         ("Cursor", "cursor-agent", cursor, "install-cursor.sh", [
             ("hooks", f"{cursor}/hooks.json", zam("cursor-hook"), scan("cursor-hook")),
-            ("status line", f"{cursor}/cli-config.json", zam("cursor-statusline"), scan("cursor-statusline"))]),
+            ("status line", f"{cursor}/cli-config.json", zam("cursor-statusline"), scan("cursor-statusline"))], False),
         ("Codex", "codex", codex, "install-codex.sh", [
-            ("hooks", f"{codex}/hooks.json", zam("codex-hook"), scan("codex-hook"))]),
+            ("hooks", f"{codex}/hooks.json", zam("codex-hook"), scan("codex-hook"))], True),
         ("agy", "agy", agy, "install-agy.sh", [
-            ("status line", f"{agy}/settings.json", zam("agy-statusline"), scan("agy-statusline"))]),
+            ("status line", f"{agy}/settings.json", zam("agy-statusline"), scan("agy-statusline"))], True),
     ]
+
+
+@functools.lru_cache(maxsize=None)
+def version(path, probe=True):
+    """first line `<path> --version` prints, "" when it fails or takes too long; once per binary and process. Its own
+    process group, so a timeout kills whatever it started too, and a child that left it can't hold us up beyond a
+    short grace. probe=False doesn't run it, the install dir (…/versions/<version>/) names the version instead"""
+    if not probe:
+        parts = os.path.realpath(path).split(os.sep)
+        return parts[-2] if len(parts) > 2 and parts[-3] == "versions" else ""
+    try:
+        p = subprocess.Popen([path, "--version"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True, errors="replace", start_new_session=True)
+    except OSError:
+        return ""
+    try:
+        out = p.communicate(timeout=PROBE_TIMEOUT)[0]
+    except subprocess.TimeoutExpired:
+        os.killpg(p.pid, signal.SIGKILL)
+        try:
+            p.communicate(timeout=0.5)  # a child that escaped the group may keep the pipe open: don't wait for it
+        except subprocess.TimeoutExpired:
+            p.stdout.close()
+            p.wait()
+        return ""
+    lines = out.strip().splitlines() if p.returncode == 0 else []
+    return lines[0].strip() if lines else ""
 
 
 def read_state():
     st = State()
     out = cmd_out("zellij", "--version")
     st.zellij = out.split()[-1] if out and out.split() else None
-    st.jq = shutil.which("jq") is not None
+    probe = {"jq": True, **{a[1]: a[5] for a in agents()}}
+    tools = {b: shutil.which(b) for b in probe}
+    with concurrent.futures.ThreadPoolExecutor(len(tools)) as ex:  # the version probes concurrently, so they cost
+        # one timeout at most (the zellij calls above and below run on their own, without one)
+        vers = dict(zip(tools, ex.map(lambda b: version(tools[b], probe[b]) if tools[b] else "", tools)))
+    st.jq, st.jq_ver = tools["jq"], vers["jq"]
     st.wasm = os.path.isfile(os.path.join(HERE, "dist", "zellij-agents.wasm"))
     cfg_dir = env_dir("ZELLIJ_CONFIG_DIR", "~/.config/zellij")
     st.cfg = os.path.realpath(os.path.join(cfg_dir, "config.kdl"))  # follows a symlink like install.sh
@@ -221,11 +259,10 @@ def read_state():
     st.binds = effective_binds(cfg) if st.zellij else parse_keybinds(cfg)[0]
     st.detected = detect_mod(st.binds)
     st.default_mod = st.detected or MODS[0]
-    st.agents = []
-    for name, binary, cfg_home, script, parts in agents():
-        found = shutil.which(binary) is not None or os.path.isdir(cfg_home)
+    st.agents = []  # (name, binary, its path or None, its version, config dir, config dir exists, script, part states)
+    for name, binary, cfg_home, script, parts, _ in agents():
         states = [(part, part_state(f, markers, ours)) for part, f, markers, ours in parts]
-        st.agents.append((name, found, script, states))
+        st.agents.append((name, binary, tools[binary], vers[binary], cfg_home, os.path.isdir(cfg_home), script, states))
     return st
 
 
@@ -245,7 +282,41 @@ def zellij_cmds(st, mod=KEEP, dl=KEEP, opts=None):
     return ([["--uninstall"]] if st.keys_mod or st.dl_tagged else []) + [["--layouts-only"] + optargs]
 
 
-# ---- status rows: (label, text, action or None, dim) ----
+# ---- the overview: rows = (segments, action or None); a segment is (text, style) ----
+# Information rows have no action: the menu's cursor skips them. Settings show their value in [brackets] and a › when
+# enter opens their actions. Every status word carries a symbol, so its meaning doesn't rest on the color.
+
+LABEL = 16
+SYM = {"ok": "✓", "warn": "⚠", "bad": "✗", "dim": "○"}  # dim: off / not installed / not found
+ANSI = {"ok": "32", "warn": "33", "bad": "31", "dim": "2", "head": "1;36", "value": "1"}
+
+
+def mark(style, text):
+    return (f"{SYM[style]} {text}", style)
+
+
+def note(text, style="dim"):
+    return ("  " + text, style)
+
+
+def header(title):
+    return [(title, "head")], None
+
+
+def info(label, segs, dim=False):
+    return [("  " + label.ljust(LABEL), "dim" if dim else "")] + segs, None
+
+
+def setting(label, value, act, notes=()):
+    """label [value] ›; without an action (it needs something first) the label dims and the › goes"""
+    return ([("  " + label.ljust(LABEL), "" if act else "dim"), ("[", ""), *value, ("]", "")]
+            + ([(" ›", "value")] if act else []) + list(notes)), act
+
+
+def tilde(path):
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path == home or path.startswith(home + "/") else path
+
 
 def onoff(st, key):
     v = st.opts.get(key)
@@ -253,86 +324,145 @@ def onoff(st, key):
 
 
 def rows(st):
-    r = []
-    ver = st.zellij
-    if ver is None:
-        r.append(("zellij", "not found: needed for the layouts and jump keys", None, False))
+    r = [header("Requirements")]
+    if st.zellij is None:
+        r.append(info("zellij", [mark("bad", "not found"), note("needed for the layouts and jump keys")]))
     else:
-        old = tuple(int(x) for x in re.findall(r"\d+", ver)[:2]) < (0, 45)
-        r.append(("zellij", ver + ("  ⚠ needs 0.45 or newer" if old else ""), None, False))
-    r.append(("jq", "ok" if st.jq else "not found: needed by every agent script", None, False))
-    r.append(("plugin build", "dist/zellij-agents.wasm" if st.wasm else "missing (install.sh builds it, needs Rust)",
-              None, False))
+        old = tuple(int(x) for x in re.findall(r"\d+", st.zellij)[:2]) < (0, 45)
+        r.append(info("zellij", [mark("warn", st.zellij), note("needs 0.45 or newer", "warn")] if old
+                      else [mark("ok", st.zellij)]))
+    r.append(info("jq", [mark("ok", st.jq_ver or "found"), note(tilde(st.jq))] if st.jq
+                  else [mark("bad", "not found"), note("needed by every agent script")]))
+    r.append(info("plugin build", [mark("ok", "dist/zellij-agents.wasm")] if st.wasm
+                  else [mark("bad", "not built"), note("scripts/install.sh runs plugin/build.sh for it, needs Rust")]))
+
+    r += [([], None), header("Zellij integration")]
     z = (lambda f: f) if st.zellij else (lambda f: None)
-    need = "" if st.zellij else "  (needs zellij)"
-    r.append(("layouts", {"installed": "installed", "missing": "not installed",
-                          "stale": "stale: from another checkout"}[st.layouts] + need, z(act_layouts), False))
-    dl = ("on" if st.dl == "agents" else "off" if st.dl is None else f'other: "{st.dl}"')
-    r.append(("default_layout", dl + need, z(act_default_layout), False))
+    need = [note("needs zellij")] if not st.zellij else []
+    r.append(setting("layouts", [{"installed": mark("ok", "installed"), "missing": mark("dim", "not installed"),
+                                  "stale": mark("warn", "stale: from another checkout")}[st.layouts]],
+                     z(act_layouts), need))
+    dl = mark("ok", "on") if st.dl == "agents" else mark("dim", "off") if st.dl is None else mark("warn", f'other: "{st.dl}"')
+    r.append(setting("default_layout", [dl], z(act_default_layout), need))
     if st.keys_mod:
-        keys = f"installed: {st.keys_mod}"
         c = clashes(st.binds, st.keys_mod)
-        keys += f"  ⚠ clashes with {', '.join(c)}" if c else ""
+        keys, notes = mark("ok", st.keys_mod), [note(f"⚠ clashes with {', '.join(c)}", "warn")] if c else []
     else:
-        keys = f"not installed (default modifier: {st.default_mod})"
-    r.append(("jump keys", keys + need, z(act_keys), False))
-    interval = st.opts.get("interval")
+        keys, notes = mark("dim", "not installed"), [note(f"default modifier: {st.default_mod}")]
+    r.append(setting("jump keys", [keys], z(act_keys), notes + need))
+
+    r += [([], None), header("Bar options")]
     if st.zellij and st.layouts == "missing":  # the options live in agents.kdl: no layouts, nothing to change
-        z, need = (lambda f: None), "  (install the layouts first)"
-    r.append(("notify", onoff(st, "notify") + need, z(lambda s: act_bool_opt(s, "notify")), False))
-    r.append(("interval", (f"{interval} s" if interval else "2 s (default)") + need, z(act_interval), False))
-    r.append(("hide_on_jump", onoff(st, "hide_on_jump") + need, z(lambda s: act_bool_opt(s, "hide_on_jump")), False))
-    for name, found, script, states in st.agents:
-        if not found:
-            r.append((name, "not found", None, True))
+        z, need = (lambda f: None), [note("install the layouts first")]
+    for key in ("notify", "interval", "hide_on_jump"):
+        if key == "interval":
+            v, act = (f"{st.opts.get(key, OPT_DEFAULTS[key])} s", "value"), act_interval
+        else:
+            v = mark("dim", "off") if st.opts.get(key) == "false" else mark("ok", "on")
+            act = lambda s, key=key: act_bool_opt(s, key)
+        r.append(setting(key, [v], z(act), ([note("(default)")] if key not in st.opts else []) + need))
+
+    r += [([], None), header("Supported agents")]
+    part = {"installed": "ok", "missing": "dim", "stale": "warn"}
+    for name, binary, path, ver, cfg_home, cfg_found, script, states in st.agents:
+        if not (path or cfg_found):
+            r.append(info(name, [mark("dim", f"not found: no {binary} on PATH, no {tilde(cfg_home)}")], dim=True))
             continue
         if all(s == "missing" for _, s in states):
-            text = "not installed"
+            value, notes = [mark("dim", "not installed")], []
         else:
-            text = ", ".join(f"{p} " + {"installed": "installed", "missing": "not installed",
-                                        "stale": "stale: from another checkout"}[s] for p, s in states)
-            if name == "Codex":
-                text += " (trust them once in Codex's /hooks)"
+            value = []
+            for p, s in states:
+                value += ([("  ", "")] if value else []) + [mark(part[s], p + (" stale: from another checkout"
+                                                                                if s == "stale" else ""))]
+            notes = [note("trust them once in Codex's /hooks", "")] if name == "Codex" else []
         act = (lambda s, a=(name, script, states): act_agent(s, *a)) if st.jq else None
-        r.append((name, text + ("" if st.jq else "  (needs jq)"), act, False))
+        r.append(setting(name, value, act, notes + ([] if st.jq else [note("needs jq", "bad")])))
+        tool = [mark("ok", ver or "found"), note(tilde(path))] if path else [mark("dim", f"{binary} not on PATH")]
+        r.append(info("", tool + [note(("· config " if cfg_found else "· no config dir ") + tilde(cfg_home))]))
     return r
 
 
-def status_text(st):
-    return "\n".join([f"zellij-agents setup: {HERE}"] + [f"  {label:<15} {text}" for label, text, _, _ in rows(st)])
+def status_text(st, color=False):
+    """the overview as text; ANSI colors only when asked (a terminal, no NO_COLOR)"""
+    fmt = lambda text, style: f"\033[{ANSI[style]}m{text}\033[0m" if color and style and text else text
+    lines = ["".join(fmt(*s) for s in segs).rstrip() for segs, _ in rows(st)]
+    return "\n".join([fmt(f"zellij-agents setup: {HERE}", "value"), ""] + lines)
 
 
 # ---- menu ----
 
-def pick(title, items, sel=0):
-    """arrow-key menu (↑/↓/j/k, enter, q/esc back); items = (text, enabled[, dim]); returns the index or None"""
-    return curses.wrapper(_pick, title, items, sel)
+def pick(title, items, sel=0, keys="enter select · q back"):
+    """arrow-key menu (↑/↓/j/k, enter, q/esc back), the one renderer of every screen; items = (text or segments,
+    selectable); a plain-text item that isn't selectable is dimmed. Returns the index or None"""
+    return curses.wrapper(_pick, title, items, sel, keys)
 
 
-def _pick(scr, title, items, sel):
+def styles():
+    a = {"": 0, "dim": curses.A_DIM, "value": curses.A_BOLD, "head": curses.A_BOLD, "ok": 0, "warn": curses.A_BOLD,
+         "bad": curses.A_BOLD}
+    if curses.has_colors() and not os.environ.get("NO_COLOR"):
+        try:
+            curses.use_default_colors()
+            for n, (k, c) in enumerate([("ok", curses.COLOR_GREEN), ("warn", curses.COLOR_YELLOW),
+                                        ("bad", curses.COLOR_RED), ("head", curses.COLOR_CYAN)], 1):
+                curses.init_pair(n, c, -1)
+                a[k] |= curses.color_pair(n)
+        except curses.error:  # no default colors: bold alone marks them
+            pass
+    return a
+
+
+def clip(s, cols):  # the longest prefix of s that fits in cols screen columns (East Asian wide = 2)
+    used = 0
+    for i, ch in enumerate(s):
+        used += 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+        if used > cols:
+            return s[:i]
+    return s
+
+
+def _pick(scr, title, items, sel, keys):
     try:
         curses.curs_set(0)
     except curses.error:
         pass
+    attrs = styles()
     enabled = [i for i, it in enumerate(items) if it[1]]
     sel = sel if sel in enabled else (enabled or [None])[0]
     top = 0
     while True:
         scr.erase()
         h, w = scr.getmaxyx()
-        put = lambda y, x, s, a=0: scr.addnstr(y, x, s, max(0, w - x - 1), a) if 0 <= y < h else None
+
+        def put(y, x, s, a=0):  # cut at the right edge, never wrapped; returns the next column
+            if 0 <= y < h and x < w - 1:
+                s = clip(s, w - x - 1)
+                scr.addstr(y, x, s, a)
+                return scr.getyx()[1]
+            return x + len(s)
+
         head = title.splitlines()
         for y, t in enumerate(head):
-            put(y, 0, t, curses.A_BOLD if y == 0 else 0)
+            put(y, 0, t, attrs["head"] if y == 0 else 0)
         y0 = len(head) + 1
         n = max(1, h - y0 - 2)
-        if sel is not None:
-            top = min(max(top, sel - n + 1), sel)
+        if sel is not None:  # keep sel visible, with the line under it and the information rows above it
+            lo = sel
+            while lo > 0 and not items[lo - 1][1]:
+                lo -= 1
+            nxt = sel + 1 if sel + 1 < len(items) and not items[sel + 1][1] else sel
+            top = min(max(top, nxt - n + 1), sel)
+            top = max(min(top, lo), sel - n + 1)
         for y, i in enumerate(range(top, min(len(items), top + n))):
-            text, en, *dim = items[i]
-            attr = curses.A_REVERSE if i == sel else curses.A_DIM if (dim and dim[0]) else 0
-            put(y0 + y, 0, ("> " if i == sel else "  ") + text, attr)
-        put(h - 1, 0, "↑/↓ move   enter select   q back", curses.A_DIM)
+            segs, en = items[i]
+            if isinstance(segs, str):
+                segs = [(segs, "" if en else "dim")]
+            rev = curses.A_REVERSE if i == sel else 0
+            x = put(y0 + y, 0, "> " if i == sel else "  ", rev)
+            for text, style in segs:
+                x = put(y0 + y, x, text, attrs[style] | rev)
+        put(h - 1, 0, "↑↓/jk move · " + keys, attrs["dim"])
         scr.refresh()
         k = scr.getch()
         if k in (ord("q"), 27):
@@ -395,7 +525,7 @@ def zellij_change(st, checked=False, **want):
 
 
 def cur(yes):
-    return "  (current)" if yes else ""
+    return [note("✓ current", "ok")] if yes else []
 
 
 def act_layouts(st):
@@ -403,9 +533,10 @@ def act_layouts(st):
         items = [(f'Install (layouts, jump keys on {st.keys_mod or st.default_mod}, default_layout "agents")', True)]
     else:
         own = st.dl == "agents" and not st.dl_tagged
-        items = [("Reinstall / update", True), ("Remove (layouts, jump keys and our default_layout line)"
-                                                + ('  ⚠ your own default_layout "agents" stays in config.kdl and '
-                                                   "would point at no layout: remove it by hand" if own else ""), True)]
+        items = [("Reinstall / update", True), ([("Remove (layouts, jump keys and our default_layout line)", "")]
+                                                + ([note('⚠ your own default_layout "agents" stays in config.kdl and '
+                                                         "would point at no layout: remove it by hand", "warn")]
+                                                   if own else []), True)]
     i = pick(f"Layouts: {st.layouts}", items)
     if i == 0:
         return zellij_change(st)
@@ -435,8 +566,9 @@ def act_default_layout(st):
     off = "off: layouts and jump keys only (start with: zellij --layout agents)"
     if on and not st.dl_tagged:
         off = "off: your own default_layout line in config.kdl, remove it by hand"
-    i = pick("default_layout", [('on: new sessions get the bar (default_layout "agents")' + cur(on), True),
-                                (off + cur(not on), not on or st.dl_tagged, on and not st.dl_tagged)])
+    can_off = not on or st.dl_tagged
+    i = pick("default_layout", [([('on: new sessions get the bar (default_layout "agents")', "")] + cur(on), True),
+                                ([(off, "" if can_off else "dim")] + cur(not on), can_off)])
     if i is None or (i == 0) == on:
         return False
     return zellij_change(st, dl=i == 0)
@@ -451,8 +583,9 @@ def act_keys(st):
     items = []
     for m in cands:
         c = clashes(st.binds, m)
-        items.append((m + ("  (default)" if same(m, st.detected) else "") + cur(same(m, st.keys_mod))
-                      + (f"  ⚠ clashes with {', '.join(c)}" if c else ""), True))
+        items.append(([(m, "value")] + ([note("(default)")] if same(m, st.detected) else [])
+                      + cur(same(m, st.keys_mod)) + ([note(f"⚠ clashes with {', '.join(c)}", "warn")] if c else []),
+                      True))
     if st.keys_mod:
         items.append(("Remove the jump keys" + (" (default_layout goes too)" if st.dl_tagged else ""), True))
     i = pick("Jump-key modifier: <mod>+1..9 jump, <mod>+0 panel, <mod>+←/→ previous/next", items)
@@ -476,7 +609,8 @@ def set_opt(st, key, value):
 
 def act_bool_opt(st, key):
     on = st.opts.get(key) != "false"
-    i = pick(f"{key}: {onoff(st, key)}", [("on" + cur(on), True), ("off" + cur(not on), True)])
+    i = pick(f"{key}: {onoff(st, key)}", [([("on", "value")] + cur(on), True),
+                                          ([("off", "value")] + cur(not on), True)])
     return False if i is None else set_opt(st, key, "true" if i == 0 else "false")
 
 
@@ -502,7 +636,7 @@ def act_agent(st, name, script, states):
 
 def main(argv):
     if argv == ["--status"]:
-        print(status_text(read_state()))
+        print(status_text(read_state(), color=sys.stdout.isatty() and not os.environ.get("NO_COLOR")))
         return 0
     if argv:
         print("usage: setup.sh [--status]", file=sys.stderr)
@@ -513,11 +647,11 @@ def main(argv):
     while True:
         st = read_state()
         r = rows(st)
-        items = [(f"{label:<15} {text}", act is not None, dim) for label, text, act, dim in r] + [("Quit", True)]
-        sel = pick(f"zellij-agents setup: {HERE}", items, sel)
-        if sel is None or sel == len(r):
+        items = [(segs, act is not None) for segs, act in r] + [("", False), ("Quit", True)]
+        sel = pick(f"zellij-agents setup: {HERE}", items, sel, "enter change · q quit")
+        if sel is None or sel == len(items) - 1:
             break
-        changed |= bool(r[sel][2](st))
+        changed |= bool(r[sel][1](st))
     if changed:
         print("Changed: start a new Zellij session for the layout and restart running agents for their hooks.")
     return 0

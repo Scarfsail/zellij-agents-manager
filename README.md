@@ -54,10 +54,10 @@ The bar also raises a system notification when an agent enters **NEEDS YOU** (`C
 ## Build
 
 ```sh
-./build.sh            # -> dist/zellij-agents.wasm
+plugin/build.sh     # -> dist/zellij-agents.wasm
 ```
 
-Needs rustup + `wasm32-wasip1`. Without a system C compiler it uses zig from `~/.local/share/zam-zig` as the host linker (`sudo apt install build-essential` removes the need).
+The plugin source (Rust crate) lives in `plugin/`; the built `dist/zellij-agents.wasm` is committed. Needs rustup + `wasm32-wasip1`. Without a system C compiler it uses zig from `~/.local/share/zam-zig` as the host linker (`sudo apt install build-essential` removes the need).
 
 ## Install (bar in every new session)
 
@@ -68,32 +68,34 @@ Needs rustup + `wasm32-wasip1`. Without a system C compiler it uses zig from `~/
 ./setup.sh --status  # the same overview as plain text, no menu
 ```
 
-`setup.sh` opens on one screen showing the plugin build, the Zellij layouts, `default_layout`, the jump keys and their modifier, the plugin options `notify` / `interval` / `hide_on_jump`, and the hooks and status line of each detected agent (Claude, Cursor, Codex, agy: found when the binary is on `PATH` or its config directory exists; the others are listed as "not found"). Pick a line with ↑/↓ (or j/k) and enter to install, update, change or remove it; q or esc goes back. Re-run it to change a preference; changing nothing changes no file. Everything it shows is read back from `config.kdl`, `agents.kdl` and the agents' settings files, so manual edits and runs of the scripts below show up too, and anything that points at a different checkout is marked "stale".
+`setup.sh` opens on one screen in four groups: **Requirements** (Zellij and its version, `jq`, the plugin build), **Zellij integration** (the layouts, `default_layout`, the jump keys and their modifier), **Bar options** (`notify` / `interval` / `hide_on_jump`) and **Supported agents** (Claude, Cursor, Codex, agy: the hooks and status line of each, and below them where its binary is, its version and its config directory; an agent is found when the binary is on `PATH` or its config directory exists, the others are listed as "not found"). Settings show their value in `[brackets]` followed by `›`; the other lines are information and the cursor skips them. ✓ marks what is installed or on, ⚠ a warning (stale, a key clash, Zellij too old), ✗ a missing requirement and ○ off or not installed. Pick a setting with ↑/↓ (or j/k) and enter to install, update, change or remove it; q or esc goes back. `--status` prints the same groups, colored only on a terminal and without `NO_COLOR`. Re-run it to change a preference; changing nothing changes no file. Everything it shows is read back from `config.kdl`, `agents.kdl` and the agents' settings files, so manual edits and runs of the scripts below show up too, and anything that points at a different checkout is marked "stale".
 
 The jump-key modifier defaults to the one your Zellij mode keys use (the modifier on `SwitchToMode "pane"`: `Ctrl` in stock Zellij); a modifier whose jump keys would shadow an existing bind in normal or locked mode is marked ⚠ with those binds, and asks before it is used. It needs `python3`, and `zellij` and `jq` for the actions that use them. The changes themselves are made by the scripts below, which stay the non-interactive way to do the same.
 
 ### By hand
 
+`setup.sh` drives these scripts, so they stay the non-interactive way: `scripts/install.sh` for Zellij (below) and `scripts/install-hooks.sh`, `scripts/install-cursor.sh`, `scripts/install-codex.sh`, `scripts/install-agy.sh` for the agents.
+
 ```sh
-./install.sh                     # layouts/agents.kdl + agents.swap.kdl in ~/.config/zellij/layouts, default_layout "agents" and jump keys in config.kdl
-./install.sh --mod "Alt"         # jump keys on another modifier (default "Ctrl Alt")
-./install.sh --opt notify=false  # a line in the bar's plugin config (repeatable; key= removes it)
-./install.sh --no-default-layout # layouts + jump keys; removes our default_layout "agents" line
-./install.sh --layouts-only      # only the layouts; config.kdl untouched
-./install.sh --uninstall         # undo
+scripts/install.sh                     # layouts/agents.kdl + agents.swap.kdl in ~/.config/zellij/layouts, default_layout "agents" and jump keys in config.kdl
+scripts/install.sh --mod "Alt"         # jump keys on another modifier (default "Ctrl Alt")
+scripts/install.sh --opt notify=false  # a line in the bar's plugin config (repeatable; key= removes it)
+scripts/install.sh --no-default-layout # layouts + jump keys; removes our default_layout "agents" line
+scripts/install.sh --layouts-only      # only the layouts; config.kdl untouched
+scripts/install.sh --uninstall         # undo
 ```
 
-Plugin options already in `agents.kdl` (`notify false`, or any you added by hand) are carried over when `install.sh` regenerates the layouts, so a plain re-run keeps them; `--opt` sets or removes one on top.
+Plugin options already in `agents.kdl` (`notify false`, or any you added by hand) are carried over when `scripts/install.sh` regenerates the layouts, so a plain re-run keeps them; `--opt` sets or removes one on top.
 
-On another machine: clone the repo anywhere, run `./install.sh`, start a new session. Needs Zellij 0.45 and `python3`; the built `dist/zellij-agents.wasm` is committed, so Rust is only needed to change the plugin. If there is no `config.kdl` yet, one is created holding only the jump keys (Zellij's defaults stay in effect). If `config.kdl` already sets another `default_layout`, the script installs the keys and layouts and asks you to switch the layout yourself. `./setup.sh` can switch it for you: your line stays in `config.kdl` as a `// zellij-agents replaced: …` comment, and `--uninstall` / `--no-default-layout` put it back.
+On another machine: clone the repo anywhere, run `./setup.sh`, start a new session. Needs Zellij 0.45 and `python3`; the built `dist/zellij-agents.wasm` is committed, so Rust is only needed to change the plugin. If there is no `config.kdl` yet, one is created holding only the jump keys (Zellij's defaults stay in effect). If `config.kdl` already sets another `default_layout`, the script installs the keys and layouts and asks you to switch the layout yourself. `./setup.sh` can switch it for you: your line stays in `config.kdl` as a `// zellij-agents replaced: …` comment, and `--uninstall` / `--no-default-layout` put it back.
 
 On first start the bar asks for permissions (read state, change state, run commands, open panes for the panel under the bar): click it and press `y`. Zellij remembers this per plugin path; bars that were already open in other tabs ask once too.
 
-The layout is generated from zellij's own default layout and swap layouts, with the bar added under the tab bar. It points at this checkout, so `./build.sh` updates new sessions directly. Existing sessions keep their layout; start a new session (or `zellij action new-tab --layout agents`) to get the bar.
+The layout is generated from zellij's own default layout and swap layouts, with the bar added under the tab bar. It points at this checkout, so `plugin/build.sh` updates new sessions directly. Existing sessions keep their layout; start a new session (or `zellij action new-tab --layout agents`) to get the bar.
 
 ## Jump keys
 
-`./install.sh` adds these to `config.kdl` (lines tagged `// zellij-agents`; re-running replaces them, `--uninstall` removes them). `Ctrl+Alt` is the default modifier; `--mod` or `./setup.sh` picks another:
+`scripts/install.sh` adds these to `config.kdl` (lines tagged `// zellij-agents`; re-running replaces them, `--uninstall` removes them). `Ctrl+Alt` is the default modifier; `--mod` or `./setup.sh` picks another:
 
 | key | action |
 |---|---|
@@ -114,7 +116,7 @@ Only the bar in the tab you are looking at acts on it, so one press is one jump.
 Zellij reloads `config.kdl` in running sessions by itself. To load a new plugin build into bars that are already running:
 
 ```sh
-# run from the checkout; must match the bar config install.sh wrote into the layout
+# run from the checkout; must match the bar config scripts/install.sh wrote into the layout
 zellij action start-or-reload-plugin -c "mode=bar,scanner=$PWD/scripts/zam-scan.py" "file:$PWD/dist/zellij-agents.wasm"
 ```
 
@@ -125,7 +127,7 @@ The configuration must match the layout's exactly, or Zellij starts a new instan
 Bar in every tab (new session with this layout):
 
 ```sh
-./install.sh --layouts-only   # writes ~/.config/zellij/layouts/agents.kdl pointing at this checkout
+scripts/install.sh --layouts-only   # writes ~/.config/zellij/layouts/agents.kdl pointing at this checkout
 zellij --layout agents
 ```
 

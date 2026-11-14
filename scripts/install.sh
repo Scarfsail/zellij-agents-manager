@@ -5,15 +5,15 @@
 #   3. default_layout "agents" in config.kdl (backup: config.kdl.zam.bak)
 #   4. <mod>+1..9 (jump to agent n), <mod>+0 (toggle the agents panel, like clicking the bar's header) and <mod>+left/right (previous/next agent, wrapping) in config.kdl
 #      (lines tagged "// zellij-agents"; re-running replaces them)
-# The layout points at this checkout's dist/ and scripts/, so ./build.sh updates new sessions directly.
-# Usage: ./install.sh [--mod "<modifier>"] [--opt key=value]... [--no-default-layout | --layouts-only | --uninstall]
+# The layout points at this checkout's dist/ and scripts/, so plugin/build.sh updates new sessions directly.
+# Usage: scripts/install.sh [--mod "<modifier>"] [--opt key=value]... [--no-default-layout | --layouts-only | --uninstall]
 #   --mod "<modifier>"   modifier of the jump keys (default "Ctrl Alt")
 #   --opt key=value      line in the bar's plugin config (e.g. notify=false); key= drops it. Options already in
 #                        agents.kdl are carried over, so a re-run keeps them
 #   --no-default-layout  layouts + jump keys, and drop our default_layout "agents" line (start with: zellij --layout agents)
 #   --layouts-only       write the layouts but leave config.kdl alone (try it: zellij --layout agents)
 set -euo pipefail
-here="$(cd "$(dirname "$0")" && pwd)"
+here="$(cd "$(dirname "$0")/.." && pwd)"
 cfg_dir="${ZELLIJ_CONFIG_DIR:-$HOME/.config/zellij}"
 cfg="$cfg_dir/config.kdl"
 layouts="$cfg_dir/layouts"
@@ -41,7 +41,7 @@ if [[ $mode == --uninstall ]]; then
   exit 0
 fi
 
-[[ -f "$here/dist/zellij-agents.wasm" ]] || "$here/build.sh"
+[[ -f "$here/dist/zellij-agents.wasm" ]] || "$here/plugin/build.sh"
 mkdir -p "$layouts"
 # fresh zellij installs run on built-in defaults without a config file; our keybinds block merges with those
 [[ -e "$cfg_real" ]] || { mkdir -p "$(dirname "$cfg_real")"; : > "$cfg_real"; }
