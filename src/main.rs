@@ -301,14 +301,8 @@ impl ZellijPlugin for State {
                 false
             }
             Event::ListClients(clients) => {
-                // Only the instance in a tab some client is looking at scans; hidden tabs idle.
-                // (TabInfo.active goes stale for plugins in hidden tabs, and hidden plugins
-                // still render, so neither can tell visibility.)
                 let was_hidden = self.hidden;
-                self.hidden = match self.my_tab {
-                    Some(mine) => !clients.iter().any(|c| self.tab_of(&c.pane_id) == Some(mine)),
-                    None => false,
-                };
+                self.hidden = self.hidden_from(&clients);
                 if !self.hidden && (was_hidden || self.due()) {
                     self.kick_scan();
                 }
@@ -483,6 +477,23 @@ impl State {
             .iter()
             .find(|(_, ps)| ps.iter().any(|p| p.is_plugin == plugin && p.id == id))
             .map(|(t, _)| *t)
+    }
+
+    /// Only the instance in a tab some client is looking at scans; hidden tabs idle.
+    /// (TabInfo.active goes stale for plugins in hidden tabs, and hidden plugins
+    /// still render, so neither can tell visibility.)
+    /// Zellij drops clients focused on the requesting plugin's own pane from `list_clients()`
+    /// (`remove_plugin_from_layout`, "to prevent deadlock"), so for the panel a missing current
+    /// client is on us. Bars are not selectable and never take focus, so the exception is panel-only;
+    /// for a bar a missing current client (e.g. no client attached, `[]`) means hidden.
+    fn hidden_from(&self, clients: &[ClientInfo]) -> bool {
+        match self.my_tab {
+            Some(mine) => {
+                let on_us_missing = self.mode == Mode::Panel && !clients.iter().any(|c| c.is_current_client);
+                !on_us_missing && !clients.iter().any(|c| self.tab_of(&c.pane_id) == Some(mine))
+            }
+            None => false,
+        }
     }
 
     /// our own plugin pane and the tab it sits in
@@ -1485,5 +1496,35 @@ mod tests {
             assert!(s.hits.iter().all(|h| h.0 < rows - 1));
         }
         assert_eq!(s.hits.len(), 1);
+    }
+
+    /// visibility from Event::ListClients: a client focused on our own pane is left out of the list
+    #[test]
+    fn hidden_from_clients() {
+        let mut s = State::default();
+        s.my_id = 7;
+        let pane = |id, is_plugin| PaneInfo { id, is_plugin, ..Default::default() };
+        s.panes.panes.insert(0, vec![pane(7, true), pane(1, false)]);
+        s.panes.panes.insert(1, vec![pane(2, false)]);
+        let client = |pane_id, current| ClientInfo::new(1, pane_id, String::new(), current);
+        s.my_tab = Some(0);
+        s.mode = Mode::Panel;
+        // the panel holds focus: the current client is missing
+        assert!(!s.hidden_from(&[client(PaneId::Terminal(2), false)]));
+        assert!(!s.hidden_from(&[]));
+        // the current client on our own pane (listed)
+        assert!(!s.hidden_from(&[client(PaneId::Plugin(7), true)]));
+        // the current client on a terminal in our tab
+        assert!(!s.hidden_from(&[client(PaneId::Terminal(1), true)]));
+        // the current client on a terminal in another tab
+        assert!(s.hidden_from(&[client(PaneId::Terminal(2), true)]));
+        // a bar is never focused: a missing current client keeps the old rule
+        s.mode = Mode::Bar;
+        assert!(s.hidden_from(&[client(PaneId::Terminal(2), false)]));
+        assert!(s.hidden_from(&[]));
+        assert!(!s.hidden_from(&[client(PaneId::Terminal(1), true)]));
+        assert!(s.hidden_from(&[client(PaneId::Terminal(2), true)]));
+        s.my_tab = None;
+        assert!(!s.hidden_from(&[client(PaneId::Terminal(2), true)]));
     }
 }
