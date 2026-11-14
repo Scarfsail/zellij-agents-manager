@@ -20,6 +20,8 @@ struct VendorUsage {
     credits: Option<Credits>,
     five_hour: Option<Window>,
     seven_day: Option<Window>,
+    /// named limits (agy's quota buckets), shown after the 5h and weekly ones
+    windows: Vec<Window>,
     error: Option<String>,
 }
 
@@ -36,10 +38,11 @@ struct Credits {
     utc_offset_s: i64,
 }
 
-/// a subscription's rolling limit (5h, week)
+/// a subscription's rolling limit (5h, week, or a named one)
 #[derive(Deserialize, Clone, Default)]
 #[serde(default)]
 struct Window {
+    label: String,
     pct: Option<f64>,
     resets_at: i64,
     utc_offset_s: i64,
@@ -527,7 +530,7 @@ impl State {
         };
         let Some(ti) = self.my_tab_info() else { return };
         let layer_hidden = !ti.are_floating_panes_visible;
-        let height = (Self::panel_header_lines(self.usage_lines().len()) + self.rows.len().max(1) + PANEL_FOOTER_LINES + 2).min(ti.viewport_rows / 2).max(6);
+        let height = (Self::panel_header_lines(self.usage_lines(ti.viewport_columns).len()) + self.rows.len().max(1) + PANEL_FOOTER_LINES + 2).min(ti.viewport_rows / 2).max(6);
         let mut cfg = self.cfg.clone();
         cfg.insert("mode".into(), "panel".into());
         cfg.insert("focus".into(), self.client_focus.iter().map(u32::to_string).collect::<Vec<_>>().join(","));
@@ -987,13 +990,16 @@ impl State {
         format!("{l0}\n{l1}")
     }
 
-    /// One line per vendor with usage data: credits spent / limit, and/or the 5h and weekly limits.
-    fn usage_lines(&self) -> Vec<Vec<(&'static str, String)>> {
+    /// One line per vendor with usage data: credits spent / limit, and/or the 5h, weekly and named limits. Limits
+    /// that do not fit `cols` continue on further lines, indented under the first one.
+    fn usage_lines(&self, cols: usize) -> Vec<Vec<(&'static str, String)>> {
         let now = self.scan.now;
         let mut lines = vec![];
         for (vendor, u) in &self.scan.usage {
             let name: String = vendor.chars().take(1).flat_map(char::to_uppercase).chain(vendor.chars().skip(1)).collect();
             let mut parts: Vec<(&'static str, String)> = vec![];
+            // where each credits / limit block starts in parts: a line breaks only there
+            let mut starts = vec![0];
             if let Some(e) = &u.error {
                 parts.push((DIM, format!("  usage n/a ({e})")));
             } else {
@@ -1019,9 +1025,11 @@ impl State {
                         parts.push(("", format!(" · resets {} {d}", MONTHS[m - 1])));
                     }
                 }
-                for (label, w) in [("5h", &u.five_hour), ("week", &u.seven_day)] {
-                    let Some(w) = w else { continue };
+                let fixed = [("5h", &u.five_hour), ("week", &u.seven_day)];
+                let fixed = fixed.into_iter().filter_map(|(label, w)| Some((label, w.as_ref()?, false)));
+                for (label, w, named) in fixed.chain(u.windows.iter().map(|w| (w.label.as_str(), w, true))) {
                     let gap = if parts.is_empty() { "  " } else { "   " };
+                    starts.push(parts.len());
                     parts.push(("", format!("{gap}{label}")));
                     if let Some(p) = w.pct.map(f64::round) {
                         let (lit, track) = meter(p);
@@ -1030,15 +1038,38 @@ impl State {
                         parts.push((pct_color(p), format!(" {p:.0}%")));
                     }
                     if w.resets_at > 0 {
-                        // the 5h window resets within hours: show how soon; the week: on which day
-                        let when = if label == "5h" { ago(w.resets_at, now) } else { WEEKDAYS[local_date(w.resets_at, w.utc_offset_s).2].into() };
+                        // the 5h window resets within hours: show how soon; the week: on which day; a named one
+                        // like the 5h one within a day, else like the week
+                        let soon = if named { w.resets_at - now < 86_400_000 } else { label == "5h" };
+                        let when = if soon { ago(w.resets_at, now) } else { WEEKDAYS[local_date(w.resets_at, w.utc_offset_s).2].into() };
                         parts.push(("", format!(" · resets {when}")));
                     }
                 }
             }
-            if !parts.is_empty() {
-                lines.push([vec![(BOLD, format!(" 📊 {name}"))], parts].concat());
+            if parts.is_empty() {
+                continue;
             }
+            let head = format!(" 📊 {name}");
+            let indent = dw(&head) + 2;
+            starts.push(parts.len());
+            let mut w = dw(&head);
+            let mut line = vec![(BOLD, head)];
+            let mut on_line = 0;
+            for b in starts.windows(2).filter(|b| b[0] < b[1]) {
+                let mut block = parts[b[0]..b[1]].to_vec();
+                let bw: usize = block.iter().map(|p| dw(&p.1)).sum();
+                let gap = dw(&block[0].1) - dw(block[0].1.trim_start());
+                // a block that would be cut moves to its own line, if more of it shows there
+                if on_line > 0 && w + bw > cols && cols.saturating_sub(indent) > cols.saturating_sub(w) {
+                    lines.push(std::mem::take(&mut line));
+                    block[0].1 = format!("{}{}", " ".repeat(indent), block[0].1.trim_start());
+                    (w, on_line) = (indent - gap, 0);
+                }
+                w += bw;
+                on_line += 1;
+                line.extend(block);
+            }
+            lines.push(line);
         }
         lines
     }
@@ -1076,7 +1107,7 @@ impl State {
             ],
             cols,
         ));
-        let usage = self.usage_lines();
+        let usage = self.usage_lines(cols);
         lines.extend(usage.iter().map(|l| fit("", l, cols)));
         let rule = fit("", &[(DIM, "─".repeat(cols))], cols);
         lines.push(rule.clone());
@@ -1429,8 +1460,9 @@ mod tests {
         for cols in [120, 40, 8] {
             let out = s.render_panel(20, cols);
             let lines: Vec<&str> = out.split('\n').collect();
-            // counts, usage, rule, column header, 3 agents, rule, help
-            assert_eq!(lines.len(), State::panel_header_lines(1) + 3 + PANEL_FOOTER_LINES);
+            // counts, usage (the week limit on its own line at 40 columns), rule, column header, 3 agents, rule, help
+            let usage = if cols == 40 { 2 } else { 1 };
+            assert_eq!(lines.len(), State::panel_header_lines(usage) + 3 + PANEL_FOOTER_LINES);
             for l in lines {
                 assert_eq!(dw(&strip(l)), cols, "{cols}: {:?}", strip(l));
             }
@@ -1496,6 +1528,55 @@ mod tests {
             assert!(s.hits.iter().all(|h| h.0 < rows - 1));
         }
         assert_eq!(s.hits.len(), 1);
+    }
+
+    /// a vendor with only named windows (agy's quota buckets) gets one labelled meter each, and the panel still fits
+    #[test]
+    fn panel_named_usage_windows() {
+        let mut s = State::default();
+        s.scan = serde_json::from_str(r#"{"now": 100000, "agents": [], "usage": {"agy": {"windows": [
+            {"label": "gemini 5h", "pct": 12, "resets_at": 3700000},
+            {"label": "3p week", "pct": 100, "resets_at": 300000000}]}}}"#)
+        .unwrap();
+        let line = strip(&s.render_panel(20, 200).split('\n').nth(1).unwrap().to_string());
+        // within a day: how soon, like the 5h window; further off: the weekday, like the week (epoch day 3 = Sunday)
+        assert!(line.starts_with(" 📊 Agy  gemini 5h ⣤⣀⣀⣀⣀ 12% · resets 1h00m   3p week ⣿⣿⣿⣿⣿ 100% · resets Sun"), "{line:?}");
+        for cols in [120, 40, 8] {
+            for l in s.render_panel(20, cols).split('\n') {
+                assert_eq!(dw(&strip(l)), cols, "{cols}: {:?}", strip(l));
+            }
+        }
+        // all five agy buckets: what does not fit 120 columns continues below, under the first meter
+        s.scan = serde_json::from_str(r#"{"now": 100000, "agents": [], "usage": {"agy": {"windows": [
+            {"label": "gemini 5h", "pct": 12, "resets_at": 3700000},
+            {"label": "gemini week", "pct": 40, "resets_at": 300000000},
+            {"label": "argon week", "pct": 65, "resets_at": 300000000},
+            {"label": "3p 5h", "pct": 85, "resets_at": 3700000},
+            {"label": "3p week", "pct": 100, "resets_at": 300000000}]}}}"#)
+        .unwrap();
+        let labels = ["gemini 5h", "gemini week", "argon week", "3p 5h", "3p week"];
+        // narrower: one limit per line, cut at its end rather than dropped
+        for (cols, n) in [(120, 2), (40, 5)] {
+            let lines: Vec<String> = s.render_panel(20, cols).split('\n').map(strip).collect();
+            let usage = &lines[1..State::panel_header_lines(s.usage_lines(cols).len()) - 2];
+            assert_eq!(usage.len(), n, "{usage:?}");
+            for l in labels {
+                assert!(usage.iter().any(|u| u.contains(&format!("{l} ⣿")) || u.contains(&format!("{l} ⣤"))), "{l}: {usage:?}");
+            }
+            let col = dw(" 📊 Agy  ");
+            for u in &usage[1..] {
+                assert!(u.chars().take(col).all(|c| c == ' ') && !u.chars().nth(col).unwrap().is_whitespace(), "{u:?}");
+            }
+        }
+        // wide enough: one line, as before
+        assert_eq!(s.usage_lines(250).len(), 1);
+        for cols in [120, 40, 8] {
+            let out = s.render_panel(20, cols);
+            assert_eq!(out.split('\n').nth(State::panel_header_lines(s.usage_lines(cols).len()) - 2).map(strip), Some("─".repeat(cols)));
+            for l in out.split('\n') {
+                assert_eq!(dw(&strip(l)), cols, "{cols}: {:?}", strip(l));
+            }
+        }
     }
 
     /// visibility from Event::ListClients: a client focused on our own pane is left out of the list

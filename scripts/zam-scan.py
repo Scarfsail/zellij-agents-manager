@@ -19,6 +19,10 @@ Codex CLI: found by its native `codex` binary in /proc, linked to the newest `co
 thread's rollout log. Codex hooks (--codex-hook) add "waiting for approval" and the current tool,
 in ~/.cache/zellij-agents/codex/<thread id>.json.
 
+agy (Antigravity CLI): found by its `agy` binary in /proc. Its status line (--agy-statusline) gives busy/idle,
+"waiting for confirmation", title, model, context, cost and quota, in ~/.cache/zellij-agents/agy/<agent pid>.json
+and usage/agy.json. Without it, a recently written conversation db the process has open means busy.
+
 Account usage (--fetch-usage): Claude's /usage numbers from api.anthropic.com/api/oauth/usage with the
 local login token, cached in ~/.cache/zellij-agents/usage/claude.json and refreshed in the background.
 """
@@ -47,14 +51,16 @@ CURSOR_DIR = os.path.join(os.path.dirname(HOOK_DIR), "cursor")
 CURSOR_CHATS = os.path.join(HOME, ".cursor", "chats")
 CODEX_DIR = os.path.join(os.path.dirname(HOOK_DIR), "codex")
 CODEX_HOME = os.environ.get("CODEX_HOME", os.path.join(HOME, ".codex"))
+AGY_DIR = os.path.join(os.path.dirname(HOOK_DIR), "agy")
+AGY_HOME = os.path.join(HOME, ".gemini", "antigravity-cli")
 USAGE_DIR = os.path.join(os.path.dirname(HOOK_DIR), "usage")
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 # refetch account usage when the cache is older than this; a running fetch blocks another for FETCH_WAIT_S
 USAGE_MAX_AGE_S = 60
 FETCH_WAIT_S = 30
 TAIL_BYTES = 256 * 1024
-# Without hooks, a Cursor agent counts as busy while its chat db was written within this many seconds
-CURSOR_BUSY_WINDOW_S = 4
+# Without Cursor hooks or the agy status line, an agent is busy while its chat db was written within this many seconds
+ACTIVITY_BUSY_WINDOW_S = 4
 # Windows toast for WSL; skipped while the terminal (ZAM_TERM) is the foreground app.
 # Text comes in via env and goes through CreateTextNode, so it is never parsed as script or XML.
 # One statement per line: -Command - reads stdin line by line.
@@ -132,6 +138,27 @@ def proc_ppid(pid):
         return int(data[data.rindex(")") + 2 :].split()[1])
     except (OSError, ValueError, IndexError):
         return None
+
+
+def proc_open_files(pid, prefix, suffix):
+    """the files the process has open whose resolved path starts with prefix and ends with suffix"""
+    for fd in os.listdir(f"/proc/{pid}/fd"):
+        try:
+            t = os.readlink(f"/proc/{pid}/fd/{fd}")
+        except OSError:
+            continue
+        if t.startswith(prefix) and t.endswith(suffix):
+            yield t
+
+
+def proc_open_file(pid, prefix, suffix):
+    """the first file the process has open whose resolved path starts with prefix and ends with suffix"""
+    return next(proc_open_files(pid, prefix, suffix), None)
+
+
+def db_mtime(db):
+    """when an SQLite db or its write-ahead log was last written (epoch s), 0 if neither exists"""
+    return max((os.path.getmtime(p) for p in (db, db + "-wal") if os.path.exists(p)), default=0)
 
 
 def proc_started_ms(pid):
@@ -422,47 +449,51 @@ def is_cursor(pid):
     return any(b"cursor-agent/versions/" in a and a.endswith(b"index.js") for a in argv)
 
 
-def cursor_pid():
-    """the Cursor agent this hook / status line command runs under"""
+def agent_pid(is_kind):
+    """the agent (is_kind: is_cursor, is_agy) this hook / status line command runs under"""
     pid = os.getppid()
     for _ in range(64):
         if pid is None or pid <= 1:
             return None
-        if is_cursor(pid):
+        if is_kind(pid):
             return pid
         pid = proc_ppid(pid)
     return None
 
 
-def cursor_state(pid):
+def agent_state(state_dir, pid):
     try:
-        with open(os.path.join(CURSOR_DIR, f"{pid}.json")) as f:
+        with open(os.path.join(state_dir, f"{pid}.json")) as f:
             st = json.load(f)
     except (OSError, ValueError):
         return {}
     return st if isinstance(st, dict) and st.get("proc_start") == proc_start(pid) else {}  # else pid reused
 
 
-def cursor_update(fields):
-    """merge fields into the state file of our Cursor agent; None deletes it"""
-    pid = cursor_pid()
+def agent_update(state_dir, is_kind, fields, phase=None):
+    """merge fields into the state file (state_dir/<pid>.json) of the agent this command runs under; None deletes it.
+    With phase(state) (busy/idle), "since" becomes fields["ts"] when the phase changes, so a long busy turn keeps
+    its age across tool calls"""
+    pid = agent_pid(is_kind)
     if not pid:
         return
-    os.makedirs(CURSOR_DIR, exist_ok=True)
-    path = os.path.join(CURSOR_DIR, f"{pid}.json")
-    lock = os.open(CURSOR_DIR, os.O_RDONLY)
+    os.makedirs(state_dir, exist_ok=True)
+    path = os.path.join(state_dir, f"{pid}.json")
+    lock = os.open(state_dir, os.O_RDONLY)
     try:
         fcntl.flock(lock, fcntl.LOCK_EX)  # hooks and the status line run concurrently
         if fields is None:
             if os.path.exists(path):
                 os.remove(path)
             return
-        st = cursor_state(pid)
-        # since: when busy/idle last flipped, so a long busy turn keeps its age across tool calls
-        if "event" in fields and ("since" not in st or (fields["event"] in CURSOR_BUSY) != (st.get("event") in CURSOR_BUSY)):
-            fields["since"] = fields["ts"]
+        st = agent_state(state_dir, pid)
+        if phase and ("since" not in st or phase({**st, **fields}) != phase(st)):
+            # busy again after needs_input: just after the request, not now, so the age after an approval
+            # counts from the request and a later request in the turn is still a new transition
+            back = phase(st) == "needs_input" and phase({**st, **fields}) == "busy"
+            fields["since"] = st["since"] + 1 if back and "since" in st else fields["ts"]
         st.update(fields, proc_start=proc_start(pid))
-        tmp = os.path.join(CURSOR_DIR, f".{pid}.tmp")
+        tmp = os.path.join(state_dir, f".{pid}.tmp")
         with open(tmp, "w") as f:
             json.dump(st, f)
         os.replace(tmp, path)
@@ -476,9 +507,10 @@ def cursor_hook():
         h = json.load(sys.stdin)
         ev = h.get("hook_event_name")
         if ev == "sessionEnd":
-            cursor_update(None)
+            agent_update(CURSOR_DIR, is_cursor, None)
         else:
-            cursor_update({"event": ev, "tool": h.get("tool_name") or "", "ts": int(time.time() * 1000)})
+            fields = {"event": ev, "tool": h.get("tool_name") or "", "ts": int(time.time() * 1000)}
+            agent_update(CURSOR_DIR, is_cursor, fields, lambda st: st.get("event") in CURSOR_BUSY)
     except BaseException:
         pass
 
@@ -497,7 +529,7 @@ def cursor_statusline(chain):
         if model:
             st["model"] = model
         st["sl_ts"] = int(time.time() * 1000)
-        cursor_update(st)
+        agent_update(CURSOR_DIR, is_cursor, st)
     except Exception:
         pass
     run_chain(chain, data)
@@ -526,15 +558,15 @@ def claude_statusline(chain):
 CURSOR_BUSY = ("beforeSubmitPrompt", "preToolUse", "postToolUse", "postToolUseFailure")
 
 
-def cursor_prune():
-    """drop state files of agents killed before their sessionEnd hook ran"""
+def agent_prune(state_dir):
+    """drop state files of agents killed before they removed their own (Cursor's sessionEnd hook), or never do (agy)"""
     try:
-        lock = os.open(CURSOR_DIR, os.O_RDONLY)
+        lock = os.open(state_dir, os.O_RDONLY)
     except OSError:
         return
     try:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        for path in glob.glob(os.path.join(CURSOR_DIR, "*.json")):
+        for path in glob.glob(os.path.join(state_dir, "*.json")):
             pid = os.path.basename(path)[:-5]
             if not pid.isdigit():
                 continue
@@ -554,7 +586,7 @@ def cursor_prune():
 
 
 def cursor_agents():
-    cursor_prune()
+    agent_prune(CURSOR_DIR)
     chats = os.path.realpath(CURSOR_CHATS)  # fd targets are resolved paths
     out = []
     for d in glob.glob("/proc/[0-9]*"):
@@ -562,15 +594,7 @@ def cursor_agents():
         try:
             if not is_cursor(pid):
                 continue
-            db = None
-            for fd in os.listdir(f"{d}/fd"):
-                try:
-                    t = os.readlink(f"{d}/fd/{fd}")
-                except OSError:
-                    continue
-                if t.startswith(chats + "/") and t.endswith("/store.db"):
-                    db = t
-                    break
+            db = proc_open_file(pid, chats + "/", "/store.db")
             env = proc_env(pid)
             if not db or not env or not env.get("ZELLIJ_PANE_ID"):
                 continue
@@ -586,7 +610,7 @@ def cursor_agents():
             m = json.loads(bytes.fromhex(v.decode() if isinstance(v, bytes) else v)) if v else {}
             m.pop("blobEncryptionKey", None)  # credential: never let it reach the output
             cwd = meta.get("cwd") or ""
-            st = cursor_state(pid)
+            st = agent_state(CURSOR_DIR, pid)
             detail = ""
             hooked = st.get("event") == "stop" or st.get("event") in CURSOR_BUSY
             if st.get("event") == "stop":
@@ -595,8 +619,8 @@ def cursor_agents():
                 status, status_ts = "busy", st.get("since", st.get("ts", 0))
                 detail = st.get("tool", "") if st["event"] != "beforeSubmitPrompt" else ""
             else:
-                mt = max((os.path.getmtime(p) for p in (db, db + "-wal") if os.path.exists(p)), default=0)
-                status, status_ts = ("busy" if time.time() - mt < CURSOR_BUSY_WINDOW_S else "idle"), int(mt * 1000)
+                mt = db_mtime(db)
+                status, status_ts = ("busy" if time.time() - mt < ACTIVITY_BUSY_WINDOW_S else "idle"), int(mt * 1000)
             name = m.get("name") or ""
             a = {
                 "kind": "cursor",
@@ -875,6 +899,163 @@ def codex_usage():
     return out or None
 
 
+# agy subcommands that are not the interactive TUI (agy 1.5.9)
+AGY_NON_TUI = {
+    b"acp", b"mcp", b"mic-serve", b"plugin", b"plugins", b"install", b"models", b"agent", b"agents", b"changelog",
+    b"help", b"remote-control", b"update",
+}
+# print mode, and the self-updater agy starts in the background
+AGY_NON_TUI_OPTS = {b"p", b"print", b"prompt", b"bg-updater"}
+# agent_state values that mean a turn is running; "reviewing" waits for the user to review a plan
+AGY_BUSY = ("working", "tool_use")
+# agy's quota bucket ids (agy 1.5.9 /usage): "3p" is its "Claude and GPT models" group
+AGY_BUCKETS = {
+    "gemini-5h": "gemini 5h", "gemini-weekly": "gemini week", "gemini-argon-wtu-weekly": "argon week",
+    "3p-5h": "3p 5h", "3p-weekly": "3p week",
+}
+
+
+def is_agy(pid):
+    """the agy TUI: not a subcommand, print mode or the background updater"""
+    try:
+        exe = os.path.basename(os.readlink(f"/proc/{pid}/exe").removesuffix(" (deleted)"))
+        # agy.<n>.old: agy updated itself on disk while this one runs
+        if not re.fullmatch(r"agy(\.\d+\.old)?", exe):
+            return False
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            argv = f.read().split(b"\0")
+    except OSError:
+        return False
+    if argv[1:2] and argv[1] in AGY_NON_TUI:
+        return False
+    # Go-style flags: -p, --print, -print=true
+    return not any(a.startswith(b"-") and a.lstrip(b"-").split(b"=")[0] in AGY_NON_TUI_OPTS for a in argv[1:])
+
+
+def agy_status(st):
+    """busy / idle / needs_input from the status line's last record"""
+    return "needs_input" if st.get("asks") else "busy" if st.get("state") in AGY_BUSY else "idle"
+
+
+def agy_statusline(chain):
+    data = sys.stdin.buffer.read()
+    try:
+        p = json.loads(data)
+        cw = p.get("context_window") or {}
+        st = {
+            "conversation_id": p.get("conversation_id"),
+            "title": p.get("conversation_title"),
+            "model": (p.get("model") or {}).get("id"),
+            "ctx_pct": cw.get("used_percentage"),
+            "ctx_size": cw.get("context_window_size"),
+            "ctx_tokens": cw.get("total_input_tokens"),
+            "cost_usd": (p.get("cost") or {}).get("total_usd"),
+            "state": p.get("agent_state"),
+            "asks": bool(p.get("tool_confirmation_pending")),
+            "ts": int(time.time() * 1000),
+        }  # None too: a new conversation clears the old values
+        agent_update(AGY_DIR, is_agy, st, agy_status)
+        if p.get("quota"):
+            write_json(os.path.join(USAGE_DIR, "agy.json"), p["quota"])
+    except Exception:
+        pass
+    run_chain(chain, data)
+
+
+def git_branch(cwd):
+    """the branch checked out in the repo holding cwd, from its HEAD file (no git subprocess); None when detached"""
+    d = cwd
+    while True:
+        git = os.path.join(d, ".git")
+        try:
+            if os.path.isfile(git):  # a worktree or submodule: "gitdir: <path>"
+                with open(git) as f:
+                    git = os.path.join(d, f.read().split("gitdir:", 1)[1].strip())
+            with open(os.path.join(git, "HEAD")) as f:
+                head = f.read().strip()
+            return head.removeprefix("ref: refs/heads/") if head.startswith("ref: refs/heads/") else None
+        except (OSError, IndexError):
+            pass
+        if d == os.path.dirname(d):
+            return None
+        d = os.path.dirname(d)
+
+
+def agy_agents():
+    agent_prune(AGY_DIR)
+    convs = os.path.realpath(os.path.join(AGY_HOME, "conversations"))  # fd targets are resolved paths
+    out = []
+    for d in glob.glob("/proc/[0-9]*"):
+        pid = int(d[6:])
+        try:
+            if not is_agy(pid):
+                continue
+            env = proc_env(pid)
+            if not env or not env.get("ZELLIJ_PANE_ID"):
+                continue
+            cwd = os.readlink(f"{d}/cwd")
+            st = agent_state(AGY_DIR, pid)
+            hooked = st.get("state") is not None  # agent_state is omitempty: a record without it is no status
+            if hooked:
+                status, status_ts = agy_status(st), st.get("since", st.get("ts", 0))
+            else:
+                # an old conversation's db can stay open after a resume or /clear: the newest one is current
+                mt = max(map(db_mtime, proc_open_files(pid, convs + "/", ".db")), default=0)
+                status = "busy" if time.time() - mt < ACTIVITY_BUSY_WINDOW_S else "idle"
+                status_ts = int(mt * 1000) if mt else proc_started_ms(pid)
+            aid = st.get("conversation_id") or f"agy-{pid}"
+            a = {
+                "kind": "agy",
+                "pid": pid,
+                "id": aid,
+                "name": os.path.basename(cwd),
+                "cwd": cwd,
+                "started_at": proc_started_ms(pid),
+                "status": status,
+                "status_since": status_ts,
+                "seen": status == "needs_input" and seen_ts(aid) >= status_ts,
+                "detail": "tool" if st.get("state") == "tool_use" else "",
+                "hooked": hooked,  # status from the status line, not guessed from db writes: only then notify
+                **pane_fields(pid, env),
+                "title": st.get("title") or "",  # empty: the plugin falls back to the pane title
+                "branch": git_branch(cwd),
+                "model": st.get("model"),
+                "cost_usd": st.get("cost_usd"),
+            }
+            a.update({k: st[k] for k in ("ctx_pct", "ctx_size", "ctx_tokens") if k in st})
+            out.append(a)
+        except Exception:
+            continue  # a vanished process must not break discovery
+    return out
+
+
+def agy_usage():
+    """agy's quota buckets as its status line last saw them; none when that is over a day old (status line not
+    installed, or agy not run lately). A bucket whose reset has passed is stale, so dropped"""
+    path = os.path.join(USAGE_DIR, "agy.json")
+    age = _age_s(path)
+    if age is None or age > 86400:
+        return None
+    try:
+        with open(path) as f:
+            quota = json.load(f)
+        windows = []
+        for bid, b in quota.items():
+            try:
+                if b.get("disabled") or not b.get("reset_time"):
+                    continue
+                reset = _epoch_ms(b["reset_time"])
+                if reset > time.time() * 1000:
+                    # remaining_fraction is omitempty: a fully used bucket comes without it
+                    pct = round((1 - (b.get("remaining_fraction") or 0)) * 100)
+                    windows.append({"label": AGY_BUCKETS.get(bid, bid), "pct": pct, **_reset(reset)})
+            except (ValueError, AttributeError, TypeError, OverflowError):
+                continue  # one malformed bucket must not drop the others
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+    return {"windows": windows} if windows else None
+
+
 def _epoch_ms(v):
     """ISO string or epoch seconds -> epoch ms"""
     from datetime import datetime
@@ -1150,18 +1331,20 @@ def main():
     chain = " ".join(sys.argv[3:] if sys.argv[2:3] == ["--"] else sys.argv[2:])
     if sys.argv[1:2] == ["--cursor-statusline"]:
         return cursor_statusline(chain)
+    if sys.argv[1:2] == ["--agy-statusline"]:
+        return agy_statusline(chain)
     if sys.argv[1:2] == ["--claude-statusline"]:
         return claude_statusline(chain)
     if sys.argv[1:2] == ["--fetch-usage"]:
         return fetch_usage()
-    agents = claude_agents() + cursor_agents() + codex_agents()
+    agents = claude_agents() + cursor_agents() + codex_agents() + agy_agents()
     agents.sort(key=lambda a: a.get("started_at", 0))
     if "--notify" in sys.argv:
         try:
             notify_transitions(agents)
         except Exception:
             pass  # notifications must never cost the bar its output
-    usage = {k: u for k, u in (("claude", claude_usage()), ("codex", codex_usage())) if u}
+    usage = {k: u for k, u in (("claude", claude_usage()), ("codex", codex_usage()), ("agy", agy_usage())) if u}
     out = {
         "now": int(time.time() * 1000),
         "agents": agents,
