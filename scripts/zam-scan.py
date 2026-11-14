@@ -14,6 +14,11 @@ Busy/idle and the current tool come from Cursor hooks (--cursor-hook), context u
 status line (--cursor-statusline); both write ~/.cache/zellij-agents/cursor/<agent pid>.json.
 Without hooks, a recently written store.db means busy.
 
+Codex CLI: found by its native `codex` binary in /proc, linked to the newest `codex-tui` thread in
+~/.codex/state_5.sqlite with its cwd; busy/idle, context and the account's 5h/week limits come from that
+thread's rollout log. Codex hooks (--codex-hook) add "waiting for approval" and the current tool,
+in ~/.cache/zellij-agents/codex/<thread id>.json.
+
 Account usage (--fetch-usage): Claude's /usage numbers from api.anthropic.com/api/oauth/usage with the
 local login token, cached in ~/.cache/zellij-agents/usage/claude.json and refreshed in the background.
 """
@@ -40,6 +45,8 @@ SEEN_DIR = os.path.join(os.path.dirname(HOOK_DIR), "seen")
 NOTIFY_DIR = os.path.join(os.path.dirname(HOOK_DIR), "notify")
 CURSOR_DIR = os.path.join(os.path.dirname(HOOK_DIR), "cursor")
 CURSOR_CHATS = os.path.join(HOME, ".cursor", "chats")
+CODEX_DIR = os.path.join(os.path.dirname(HOOK_DIR), "codex")
+CODEX_HOME = os.environ.get("CODEX_HOME", os.path.join(HOME, ".codex"))
 USAGE_DIR = os.path.join(os.path.dirname(HOOK_DIR), "usage")
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 # refetch account usage when the cache is older than this; a running fetch blocks another for FETCH_WAIT_S
@@ -268,22 +275,29 @@ def _scan_lines(lines, info):
                 info["branch"] = br
 
 
-def transcript_info(path):
-    """Context tokens + model (last assistant usage), session title, git branch."""
+def tail_scan(path, scan, done):
+    """info filled by scan(lines newest first, info) from the last TAIL_BYTES of a JSONL log;
+    if that is not done(info), from the whole file once (a line written long ago and not repeated since)"""
     info = {}
-    if not path:
-        return info
     try:
         with open(path, "rb") as f:
             f.seek(0, 2)
             size = f.tell()
             f.seek(max(0, size - TAIL_BYTES))
-            _scan_lines(reversed(f.read().splitlines()), info)
-            if size > TAIL_BYTES and not ({"custom_title", "ai_title"} & info.keys()):
-                f.seek(0)  # title written early and not repeated since: scan the whole file once
-                _scan_lines(reversed(f.read().splitlines()), info)
+            scan(reversed(f.read().splitlines()), info)
+            if size > TAIL_BYTES and not done(info):
+                f.seek(0)
+                scan(reversed(f.read().splitlines()), info)
     except OSError:
         pass
+    return info
+
+
+def transcript_info(path):
+    """Context tokens + model (last assistant usage), session title, git branch."""
+    if not path:
+        return {}
+    info = tail_scan(path, _scan_lines, lambda i: {"custom_title", "ai_title"} & i.keys())
     # Claude: custom-title (/rename) beats ai-title; both are last-wins
     info["title"] = info.pop("custom_title", None) or info.pop("ai_title", None) or ""
     info.pop("ai_title", None)
@@ -608,6 +622,216 @@ def cursor_agents():
     return out
 
 
+# argv[1] of codex runs that are not an interactive TUI (codex-cli 0.167); app-server is the shared daemon
+CODEX_NON_TUI = {
+    b"exec", b"e", b"review", b"login", b"logout", b"mcp", b"mcp-server", b"plugin", b"app-server",
+    b"remote-control", b"completion", b"update", b"doctor", b"sandbox", b"debug", b"apply", b"a", b"queue",
+    b"archive", b"delete", b"migrate-rollouts", b"migrate-nfs-db", b"unarchive", b"cloud", b"exec-server",
+    b"features", b"help",
+}
+CODEX_EVENTS = (b'"task_started"', b'"task_complete"', b'"turn_aborted"', b'"token_count"')
+# Codex's context % leaves out this many tokens of fixed prompt overhead, on both sides
+CODEX_BASELINE_TOKENS = 12000
+
+
+def is_codex(pid):
+    """the native codex binary (not its node wrapper) running the interactive TUI"""
+    try:
+        exe = os.readlink(f"/proc/{pid}/exe")
+        if os.path.basename(exe.removesuffix(" (deleted)")) != "codex":  # " (deleted)": upgraded on disk
+            return False
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            argv = f.read().split(b"\0")
+    except OSError:
+        return False
+    # argv[0] is codex for the TUI (the npm wrapper passes the binary's path); helpers re-exec it under their own name
+    return os.path.basename(argv[0]) == b"codex" and (len(argv) < 2 or argv[1] not in CODEX_NON_TUI)
+
+
+def codex_query(sql, *args):
+    con = sqlite3.connect(f"file:{os.path.join(CODEX_HOME, 'state_5.sqlite')}?mode=ro", uri=True, timeout=0.2)
+    try:
+        return con.execute(sql, args).fetchall()
+    finally:
+        con.close()
+
+
+def _scan_rollout(lines, info):
+    """Fill info from Codex rollout lines (newest first): the last turn start/end, context, account rate limits."""
+    for line in lines:
+        if "last_ts" not in info:  # the newest line: whether the turn moved on after a hook
+            m = re.match(rb'\{"timestamp":"([^"]+)"', line)
+            try:
+                info["last_ts"] = _epoch_ms(m[1].decode()) if m else 0
+            except ValueError:
+                info["last_ts"] = 0
+        if {"status", "ctx_tokens", "rate_limits"} <= info.keys():
+            break
+        if b'"event_msg"' not in line or not any(t in line for t in CODEX_EVENTS):
+            continue
+        try:
+            d = json.loads(line)
+            p, typ, ts = d["payload"], d["payload"]["type"], _epoch_ms(d["timestamp"])
+        except (ValueError, KeyError, TypeError):
+            continue
+        if typ in ("task_started", "task_complete", "turn_aborted") and "status" not in info:
+            # turn_aborted: the user pressed Esc, no task_complete follows
+            info["status"] = "busy" if typ == "task_started" else "idle"
+            info["status_since"] = ts
+        elif typ == "token_count":
+            usage = (p.get("info") or {}).get("last_token_usage")
+            if usage and "ctx_tokens" not in info:
+                info["ctx_tokens"], info["ctx_size"] = usage.get("total_tokens"), p["info"].get("model_context_window")
+            rl = p.get("rate_limits") or {}
+            if (rl.get("primary") or rl.get("secondary")) and "rate_limits" not in info:
+                info["rate_limits"] = rl
+
+
+def rollout_info(path, thread_id=None):
+    """from the rollout's tail only; with thread_id, a last turn event older than the tail (a turn that logged
+    more than TAIL_BYTES) is read from the whole file once and kept in CODEX_DIR/<thread id>.turn.json"""
+    info = tail_scan(path, _scan_rollout, lambda i: True) if path else {}
+    if not (path and thread_id) or "status" in info or os.path.getsize(path) <= TAIL_BYTES:
+        return info
+    cache = os.path.join(CODEX_DIR, f"{thread_id}.turn.json")
+    try:
+        with open(cache) as f:
+            c = json.load(f)
+    except (OSError, ValueError):
+        c = None
+    if not (isinstance(c, dict) and c.get("rollout") == path):
+        full = {}
+        with open(path, "rb") as f:
+            _scan_rollout(reversed(f.read().splitlines()), full)
+        if "status" not in full:
+            return info
+        c = {"rollout": path, "status": full["status"], "status_since": full["status_since"]}
+        write_json(cache, c)
+    info.update(status=c.get("status"), status_since=c.get("status_since"))
+    return info
+
+
+def codex_state(thread_id):
+    try:
+        with open(os.path.join(CODEX_DIR, f"{thread_id}.json")) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return st if isinstance(st, dict) else {}
+
+
+def codex_hook():
+    # never block Codex: no stdout, no errors. Hooks run in Codex's shared app-server daemon, so the
+    # state is keyed by the thread (session_id), not by a parent pid
+    try:
+        h = json.load(sys.stdin)
+        sid = h.get("session_id") or ""
+        if not safe_id(sid):
+            return
+        path = os.path.join(CODEX_DIR, f"{sid}.json")
+        if h.get("hook_event_name") == "SessionEnd":
+            os.remove(path)
+        else:
+            write_json(path, {"event": h.get("hook_event_name"), "tool": h.get("tool_name") or "", "ts": int(time.time() * 1000)})
+    except BaseException:
+        pass
+
+
+def codex_prune(live):
+    """drop hook state of threads no running TUI links to, after a day (killed before SessionEnd, or not a TUI)"""
+    for path in glob.glob(os.path.join(CODEX_DIR, "*.json")):
+        age = _age_s(path)
+        if os.path.basename(path).split(".")[0] not in live and age is not None and age > 86400:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+def codex_agents():
+    out = []
+    for d in glob.glob("/proc/[0-9]*"):
+        pid = int(d[6:])
+        try:
+            if not is_codex(pid):
+                continue
+            env = proc_env(pid)
+            if not env or not env.get("ZELLIJ_PANE_ID"):
+                continue
+            started = proc_started_ms(pid)
+            cwd = os.readlink(f"{d}/cwd")
+            try:
+                # the TUI names no thread anywhere: take the newest one it can own (not a subagent's or codex exec's)
+                rows = codex_query(
+                    "SELECT id, cwd, title, git_branch, model, rollout_path FROM threads WHERE cwd = ? AND archived = 0"
+                    " AND thread_source = 'user' AND originator = 'codex-tui' AND updated_at_ms >= ?"
+                    " ORDER BY updated_at_ms DESC LIMIT 1",
+                    cwd,
+                    started,
+                )
+                tid, cwd, title, branch, model, rollout = rows[0] if rows else (None, cwd, "", None, None, None)
+                info, st = rollout_info(rollout, tid), codex_state(tid) if tid else {}
+            except Exception:  # unreadable or changed state db: list it unlinked, like a TUI with no thread yet
+                tid, title, branch, model, info, st = None, "", None, None, {}, {}
+            status, status_ts = info.get("status", "idle"), info.get("status_since", started)
+            detail, hook_ts = "", st.get("ts", 0)
+            # a rollout line after the request: approved (or denied), the turn goes on
+            if st.get("event") == "PermissionRequest" and hook_ts > status_ts and info.get("last_ts", 0) <= hook_ts:
+                status, status_ts, detail = "needs_input", hook_ts, st.get("tool") or "permission"
+            elif status == "busy" and hook_ts > status_ts:
+                if st.get("event") == "PreToolUse":
+                    detail = st.get("tool") or ""
+                status_ts = hook_ts  # busy again after a request, so the next one in this turn is new
+            a = {
+                "kind": "codex",
+                "pid": pid,
+                "id": tid or f"codex-{pid}",
+                "name": os.path.basename(cwd),
+                "cwd": cwd,
+                "started_at": started,
+                "status": status,
+                "status_since": status_ts,
+                "seen": status == "needs_input" and seen_ts(tid) >= status_ts,
+                "detail": detail,
+                **pane_fields(pid, env),
+                "title": title or "",  # empty: the plugin falls back to the pane title
+                "branch": branch,
+                "model": model,
+            }
+            tokens, win = info.get("ctx_tokens"), info.get("ctx_size")
+            if tokens is not None:
+                a["ctx_tokens"] = tokens
+            if tokens is not None and win and win > CODEX_BASELINE_TOKENS:
+                # Codex's own "% context left", rounded, turned into % used so it matches the TUI
+                eff = win - CODEX_BASELINE_TOKENS
+                left = round(min(100, max(0, (eff - max(0, tokens - CODEX_BASELINE_TOKENS)) / eff * 100)))
+                a.update(ctx_size=win, ctx_pct=100 - left)
+            out.append(a)
+        except Exception:
+            continue  # a vanished process or unreadable state db must not break discovery
+    codex_prune({a["id"] for a in out})
+    return out
+
+
+def codex_usage():
+    """the account's 5h/week limits as of the newest rollout; a window whose reset has passed is stale, so dropped"""
+    out = {}
+    try:
+        # the newest few: a thread that was just created may not have logged its limits yet
+        rows = codex_query("SELECT rollout_path FROM threads ORDER BY updated_at_ms DESC LIMIT 3")
+    except sqlite3.Error:
+        return None
+    for (path,) in rows:
+        rl = rollout_info(path).get("rate_limits")
+        if rl:
+            for w in (rl.get("primary"), rl.get("secondary")):
+                key = {300: "five_hour", 10080: "seven_day"}.get((w or {}).get("window_minutes"))
+                if key and (w.get("resets_at") or 0) > time.time():
+                    out[key] = {"pct": w.get("used_percent"), **_reset(w["resets_at"] * 1000)}
+            break
+    return out or None
+
+
 def _epoch_ms(v):
     """ISO string or epoch seconds -> epoch ms"""
     from datetime import datetime
@@ -828,7 +1052,7 @@ def notify_transitions(agents):
             continue  # this bar's snapshot is older than the recorded state: never move it backwards
         fire = (
             prev is not None
-            and (a.get("kind") != "cursor" or a.get("hooked"))
+            and a.get("hooked", True)
             and (
                 (status == "needs_input" and prev_status != "needs_input")
                 or (status == "idle" and prev_status in ("busy", "needs_input"))
@@ -878,6 +1102,8 @@ def main():
         return
     if sys.argv[1:2] == ["--cursor-hook"]:
         return cursor_hook()
+    if sys.argv[1:2] == ["--codex-hook"]:
+        return codex_hook()
     chain = " ".join(sys.argv[3:] if sys.argv[2:3] == ["--"] else sys.argv[2:])
     if sys.argv[1:2] == ["--cursor-statusline"]:
         return cursor_statusline(chain)
@@ -885,18 +1111,18 @@ def main():
         return claude_statusline(chain)
     if sys.argv[1:2] == ["--fetch-usage"]:
         return fetch_usage()
-    agents = claude_agents() + cursor_agents()
+    agents = claude_agents() + cursor_agents() + codex_agents()
     agents.sort(key=lambda a: a.get("started_at", 0))
     if "--notify" in sys.argv:
         try:
             notify_transitions(agents)
         except Exception:
             pass  # notifications must never cost the bar its output
-    usage = claude_usage()
+    usage = {k: u for k, u in (("claude", claude_usage()), ("codex", codex_usage())) if u}
     out = {
         "now": int(time.time() * 1000),
         "agents": agents,
-        "usage": {"claude": usage} if usage else {},
+        "usage": usage,
     }
     json.dump(out, sys.stdout, separators=(",", ":"))
 

@@ -4,7 +4,9 @@
 # ~/.cursor/cli-config.json gives context %, chaining to your own status line command if you have one.
 # Restart running Cursor agents afterwards. Listing them needs none of this.
 set -euo pipefail
-scan="$(cd "$(dirname "$0")" && pwd)/zam-scan.py"
+here="$(cd "$(dirname "$0")" && pwd)"
+. "$here/zam-install-lib.sh"
+scan="$here/zam-scan.py"
 hook=$(jq -rn --arg s "$scan" '"python3 \($s|@sh) --cursor-hook"')
 sl=$(jq -rn --arg s "$scan" '"python3 \($s|@sh) --cursor-statusline"')
 hooks="$HOME/.cursor/hooks.json"
@@ -16,19 +18,6 @@ events='["beforeSubmitPrompt","preToolUse","postToolUse","postToolUseFailure","s
 defs='def ourhook: (.command // "") | contains("zam-scan.py") and contains("--cursor-hook");
   def oursl: contains("zam-scan.py") and contains("--cursor-statusline");
   def slrest: .[index("--cursor-statusline") + 19:];'
-
-edit() { # file, jq filter: replace the file atomically (keeping its mode); on first install, back up the original
-  local f=$1 tmp
-  tmp=$(mktemp "$(dirname "$f")/.$(basename "$f").XXXXXX")
-  jq --arg hook "$hook" --arg sl "$sl" --arg q "'" --argjson events "$events" --argjson had "$had" "$defs $2" "$f" > "$tmp"
-  if ! cmp -s "$tmp" "$f"; then
-    [[ $uninstall || -e "$f.zam.bak" ]] || cp "$f" "$f.zam.bak"
-    chmod --reference="$f" "$tmp"
-    mv -f "$tmp" "$f"
-  else
-    rm "$tmp"
-  fi
-}
 
 uninstall= had='[]'
 if [[ ${1:-} == --uninstall ]]; then
