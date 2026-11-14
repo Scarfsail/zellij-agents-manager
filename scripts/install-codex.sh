@@ -11,7 +11,9 @@ hooks="${CODEX_HOME:-$HOME/.codex}/hooks.json"
 events='["UserPromptSubmit","PreToolUse","PermissionRequest","PostToolUse","Stop","SessionEnd"]'
 
 # our matcher groups by pattern, not exact path, so stale ones from a moved checkout are found too
-defs='def ourhook: any(.hooks[]?; (.command // "") | contains("zam-scan.py") and contains("--codex-hook"));'
+defs='def isours: (.command // "") | contains("zam-scan.py") and contains("--codex-hook");
+def ourhook: any(.hooks[]?; isours);
+def strip: .hooks |= map(select(isours | not));'
 
 uninstall= had='[]'
 if [[ ${1:-} == --uninstall ]]; then
@@ -21,7 +23,7 @@ if [[ ${1:-} == --uninstall ]]; then
   [[ -f "$hooks" ]] && edit "$hooks" '
     reduce $events[] as $ev (.;
       if any(.hooks[$ev][]?; ourhook) then
-        .hooks[$ev] |= map(select(ourhook | not)) | if .hooks[$ev] == [] and ($had | index($ev) | not) then del(.hooks[$ev]) else . end
+        .hooks[$ev] |= map(if ourhook then (strip | select(.hooks | length > 0)) else . end) | if .hooks[$ev] == [] and ($had | index($ev) | not) then del(.hooks[$ev]) else . end
       else . end)'
   echo "Codex hooks removed"
   exit 0
@@ -36,5 +38,9 @@ edit "$hooks" '
     .hooks[$ev] //= [] |
     .hooks[$ev] |= (([.[] | ourhook] | index(true)) as $i |
       if $i == null then . + [$ours]
-      else [to_entries[] | select(.key == $i or (.value | ourhook | not)) | .value | if ourhook then $ours else . end] end))'
+      else [to_entries[] | .key as $k | .value as $g |
+        if $k == $i then $g | .hooks |= (reduce .[] as $h ({l: [], s: false};
+          if ($h | isours) then (if .s then . else .l += [$h | .command = $hook] | .s = true end) else .l += [$h] end) | .l)
+        elif ($g | ourhook) then $g | strip | select(.hooks | length > 0)
+        else $g end] end))'
 echo "Codex hooks in $hooks (backup: hooks.json.zam.bak). Trust them once in Codex's /hooks, then restart running Codex agents"
