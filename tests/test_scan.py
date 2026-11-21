@@ -17,8 +17,9 @@ _spec.loader.exec_module(scan)
 CLAUDE = {"kind": "claude", "zellij_session": "work", "pane_id": 3, "name": "svc", "branch": "main"}
 
 
-def native(status, since, muted=False, pane=3, app="claude-code"):
-    return {"session": "work", "pane": pane, "status": status, "since_ms": since, "muted": muted, "app": app,
+def native(status, since, muted=False, pane=3, app="claude-code", saw_entry=True):
+    return {"session": "work", "pane": pane, "status": status, "since_ms": since, "saw_entry": saw_entry,
+            "muted": muted, "app": app,
             "title": "fix login", "text": "needs approval: Bash" if status == "needs_you" else ""}
 
 
@@ -86,6 +87,17 @@ class NotifyTest(unittest.TestCase):
         self.assertEqual(self.scan(native("done", 9000)), [("Claude finished", "svc@main · fix login")])
         self.assertEqual(self.scan(native("done", 9000)), [])  # the same entry again, as another bar sees it
         self.assertEqual(self.scan(native("done", 9000, muted=True)), [])
+
+    def test_bar_started_since(self):
+        # a new bar knows only Zellij's latest restamp of the unanswered prompt: not a second prompt
+        self.scan(native("working", 100))
+        self.assertEqual(len(self.scan(native("needs_you", 5000))), 1)
+        self.assertEqual(self.scan(native("needs_you", 6000, saw_entry=False)), [])
+        self.assertEqual(self.scan(native("needs_you", 5000)), [])  # the bar that saw it, again
+        # another status is news to it, and so is an entry it saw
+        self.assertEqual(len(self.scan(native("done", 9000, saw_entry=False))), 1)
+        self.scan(native("working", 9500))
+        self.assertEqual(len(self.scan(native("done", 9800))), 1)
 
     def test_since_zero_is_not_older(self):
         # seen twice: Zellij reports idle with no time; it is recorded, and the next change still fires

@@ -1099,7 +1099,7 @@ def _int(v):
 
 def notify_transitions(agents, native):
     """notify when an agent pane enters needs you, done or failed in Zellij (native: the bar's
-    [{session, pane, status, since_ms, muted, app, title, text}]), once across all bars; never while muted"""
+    [{session, pane, status, since_ms, saw_entry, muted, app, title, text}]), once across all bars; never while muted"""
     try:
         os.makedirs(NOTIFY_DIR, exist_ok=True)
         files = os.listdir(NOTIFY_DIR)
@@ -1126,6 +1126,8 @@ def notify_transitions(agents, native):
         prev_since = _int(prev_since)
         if since and prev_since is not None and since < prev_since:
             continue  # this bar's snapshot is older than the recorded state: never move it backwards (0: no time)
+        if status == prev_status and not n.get("saw_entry"):
+            continue  # a bar started since only knows Zellij's latest restamp: no new entry, only another status is
         # a new entry into the state: another status, or the same one again later (a second prompt, a second turn)
         changed = status != prev_status or since != prev_since
         fire = prev is not None and not n.get("muted") and status in NOTIFY_ON and changed

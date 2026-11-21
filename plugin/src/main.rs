@@ -96,6 +96,9 @@ struct Row {
     /// when the pane entered its status, for notifications: Zellij restamps `status_since` when an agent re-sends the
     /// same state, which is no new entry. A status in between (needs you → working → needs you) is one
     entered_ms: i64,
+    /// this bar saw the pane enter its status. A bar started since only knows the latest restamp, so its since is no
+    /// new entry into the same status (another bar's notification would repeat)
+    saw_entry: bool,
     /// (floating, y, x) on screen: numbers go top-to-bottom, left-to-right within a tab
     screen_pos: (bool, usize, usize),
 }
@@ -158,8 +161,8 @@ struct State {
     select_focused: bool,
     /// Zellij's attention state of every running session (GlobalAttentionUpdate); None until the first update arrives
     attention: Option<GlobalAttention>,
-    /// (session, pane) → (status, entered_ms) of the native rows, from the last rebuild
-    entered: HashMap<(String, u32), (String, i64)>,
+    /// (session, pane) → (status, entered_ms, saw_entry) of the native rows, from the last rebuild
+    entered: HashMap<(String, u32), (String, i64, bool)>,
     /// SGR for the focused chip, from zellij's theme (ribbon_selected = the active tab's colours)
     active_style: Option<String>,
     error: Option<String>,
@@ -681,6 +684,7 @@ impl State {
                     "pane": r.agent.pane_id,
                     "status": r.agent.status,
                     "since_ms": r.entered_ms,
+                    "saw_entry": r.saw_entry,
                     "muted": r.muted,
                     "app": r.agent.kind,
                     "title": self.purpose(r),
@@ -702,7 +706,7 @@ impl State {
         let same = |n: &NativePane, a: &Agent| a.zellij_session.as_deref() == Some(n.session) && a.pane_id == Some(n.pane);
         // the scanner's agents, then the native agent panes it doesn't know (OpenCode, Copilot CLI, …): no extras.
         // An app the scanner detects is its call: a Claude that quit leaves a Done record behind in its pane
-        let unknown = native.iter().filter(|n| !self.scan.agents.iter().any(|a| same(n, a)) && !n.app.is_some_and(|app| SCANNED_APPS.contains(&app))).map(|n| Agent {
+        let unknown = native.iter().filter(|n| !self.scan.agents.iter().any(|a| same(n, a)) && !n.app.is_some_and(|app| SCANNED_APPS.iter().any(|s| s.1 == app))).map(|n| Agent {
             kind: n.app.unwrap_or_default().to_string(),
             name: n.app.unwrap_or("agent").to_string(),
             zellij_session: Some(n.session.to_string()),
@@ -715,7 +719,12 @@ impl State {
             .map(|mut a| {
                 let local = a.zellij_session.is_some() && a.zellij_session == self.session;
                 let loc = if local { a.pane_id.and_then(|id| where_.get(&id)) } else { None };
-                let n = native.iter().find(|n| same(n, &a));
+                // a record another agent left in the pane (a Claude, then Cursor) is not this one's. Cursor reports none
+                let owns = |n: &NativePane| match SCANNED_APPS.iter().find(|s| s.0 == a.kind) {
+                    Some(&(_, app)) => n.app.map_or(true, |x| x == app),
+                    None => a.kind != "cursor",
+                };
+                let n = native.iter().find(|n| same(n, &a) && owns(n));
                 let mut row = Row {
                     pane_title: loc.map(|l| l.1.clone()).or_else(|| n.map(|n| n.title.to_string())).unwrap_or_default(),
                     focused: loc.is_some() && a.pane_id.map_or(false, |id| self.client_focus.contains(&id)),
@@ -743,11 +752,12 @@ impl State {
         let mut entered = HashMap::new();
         for r in rows.iter_mut().filter(|r| r.native) {
             let key = (r.agent.zellij_session.clone().unwrap_or_default(), r.agent.pane_id.unwrap_or_default());
-            r.entered_ms = match self.entered.get(&key) {
-                Some((status, since)) if *status == r.agent.status => *since,
-                _ => r.agent.status_since,
+            (r.entered_ms, r.saw_entry) = match self.entered.get(&key) {
+                Some((status, since, saw)) if *status == r.agent.status => (*since, *saw),
+                Some(_) => (r.agent.status_since, true),
+                None => (r.agent.status_since, false),
             };
-            entered.insert(key, (r.agent.status.clone(), r.entered_ms));
+            entered.insert(key, (r.agent.status.clone(), r.entered_ms, r.saw_entry));
         }
         self.entered = entered;
         // local agents first, in tab order; then other sessions; then agents outside zellij
@@ -854,8 +864,8 @@ impl Row {
     }
 }
 
-/// the OSC 7501 apps of the agents the scanner finds (Claude Code, Codex, agy); Cursor reports none
-const SCANNED_APPS: [&str; 3] = ["claude-code", "codex", "antigravity"];
+/// (the scanner's kind, its OSC 7501 app) of the agents the scanner finds (Claude Code, Codex, agy); Cursor reports none
+const SCANNED_APPS: [(&str, &str); 3] = [("claude", "claude-code"), ("codex", "codex"), ("agy", "antigravity")];
 
 /// An agent pane in Zellij's attention data, the same test for this session and the others: it reports with an app
 /// now, or reported before and stays listed while idle. A shell with new output or a finished command is neither.
@@ -1664,14 +1674,30 @@ mod tests {
             s.rebuild();
             let native: Vec<serde_json::Value> = serde_json::from_str(&s.native_json()).unwrap();
             let e = native.into_iter().find(|e| e["pane"] == 4).unwrap();
-            (e["status"].as_str().unwrap().to_string(), e["since_ms"].as_i64().unwrap())
+            (e["status"].as_str().unwrap().to_string(), e["since_ms"].as_i64().unwrap(), e["saw_entry"].as_bool().unwrap())
         };
-        // the agent sends the same prompt again: Zellij restamps it, the entry stays
-        assert_eq!(set(&mut s, AttentionStatus::NeedsYou, 6000), ("needs_you".into(), 5000));
+        // the agent sends the same prompt again: Zellij restamps it, the entry stays. This bar started with the prompt
+        // up, so it did not see it entered
+        assert_eq!(set(&mut s, AttentionStatus::NeedsYou, 6000), ("needs_you".into(), 5000, false));
         assert_eq!(s.rows.iter().find(|r| r.agent.pane_id == Some(4)).unwrap().agent.status_since, 6000);
-        // approved, then a second prompt: a new entry
-        assert_eq!(set(&mut s, AttentionStatus::Working, 7000), ("working".into(), 7000));
-        assert_eq!(set(&mut s, AttentionStatus::NeedsYou, 8000), ("needs_you".into(), 8000));
+        // approved, then a second prompt: a new entry, seen by this bar
+        assert_eq!(set(&mut s, AttentionStatus::Working, 7000), ("working".into(), 7000, true));
+        assert_eq!(set(&mut s, AttentionStatus::NeedsYou, 8000), ("needs_you".into(), 8000, true));
+        assert_eq!(set(&mut s, AttentionStatus::NeedsYou, 9000), ("needs_you".into(), 8000, true));
+    }
+
+    /// a record another agent left in the pane is not the scanned agent's: Cursor keeps its guess, Claude its own
+    #[test]
+    fn native_record_of_another_agent() {
+        let mut s = State { session: Some("here".into()), ..Default::default() };
+        let pane = |id, app| PaneInfo { id, attention: attention(AttentionStatus::Done, "done", Some(app)), ..Default::default() };
+        s.panes.panes.insert(0, vec![pane(3, "claude-code"), pane(4, "codex")]);
+        let agent = |kind: &str, pane| Agent { kind: kind.into(), zellij_session: Some("here".into()), pane_id: Some(pane), status: "working".into(), ..Default::default() };
+        s.scan.agents = vec![agent("cursor", 3), agent("claude", 4)];
+        s.rebuild();
+        let rows: Vec<(&str, &str, bool)> = s.rows.iter().map(|r| (r.agent.kind.as_str(), r.agent.status.as_str(), r.native)).collect();
+        assert_eq!(rows, [("cursor", "working", false), ("claude", "working", false)]);
+        assert_eq!(s.native_json(), "[]");
     }
 
     /// a muted agent waiting on you keeps its icon, dimmed, and its chip never pulses
