@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Adds zam-hook.sh to ~/.claude/settings.json and wraps its status line (idempotent, keeps a .zam.bak of what it
-# changes; --uninstall undoes it).
-# The hooks are only needed for the "NEEDS YOU" (permission prompt) state; everything else works without them.
-# The status line wrapper (zam-scan.py --claude-statusline) records each session's cost for the panel and
+# Wraps Claude Code's status line in ~/.claude/settings.json (idempotent, keeps a .zam.bak of what it changes;
+# --uninstall undoes it). The wrapper (zam-scan.py --claude-statusline) records each session's cost for the panel and
 # chains to your own status line command, which gets the same input and whose output is still shown.
+# Claude's state comes from Zellij itself, so no hooks are installed. --uninstall also strips the zam-hook.sh hooks
+# older versions added; --uninstall-hooks strips only those.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 . "$here/zam-install-lib.sh"
-hook="$here/zam-hook.sh"
 sl=$(jq -rn --arg s "$here/zam-scan.py" '"python3 \($s|@sh) --claude-statusline"')
 settings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+# the events older versions hooked
 events='["PreToolUse","PostToolUse","PermissionRequest","Notification","UserPromptSubmit","Stop","SessionEnd"]'
 
 # our hooks by pattern, not exact path, so stale ones from a moved checkout are removed too
@@ -17,7 +17,7 @@ defs='def isours: (.command // "") | contains("zam-hook.sh");
 def ourhook: any(.hooks[]?; isours);'
 
 uninstall= had='[]'
-if [[ ${1:-} == --uninstall ]]; then
+if [[ ${1:-} == --uninstall || ${1:-} == --uninstall-hooks ]]; then
   uninstall=1
   # events that already had an empty array before install (per the backup) keep it, and so does an empty "hooks"
   hadhooks=false
@@ -32,21 +32,16 @@ if [[ ${1:-} == --uninstall ]]; then
         .hooks[$ev] |= map(if ourhook then (.hooks |= map(select(isours | not)) | select(.hooks | length > 0)) else . end) | if .hooks[$ev] == [] and ($had | index($ev) | not) then del(.hooks[$ev]) else . end
       else . end) |
     if .hooks == {} and (hadhooks | not) then del(.hooks) else . end'
+  if [[ $1 == --uninstall-hooks ]]; then
+    echo "old Claude hooks removed"
+    exit 0
+  fi
   [[ -f "$settings" ]] && sl_uninstall "$settings"
-  echo "Claude hooks and status line removed"
+  echo "Claude status line and old hooks removed"
   exit 0
 fi
 
 mkdir -p "$(dirname "$settings")"
 [[ -f "$settings" ]] || echo '{}' > "$settings"
-# our hooks from another checkout are dropped first (their groups too, once empty), so a reinstall replaces them
-edit "$settings" '
-  def stale: isours and .command != $hook;
-  .hooks //= {} |
-  reduce $events[] as $ev (.;
-    .hooks[$ev] //= [] |
-    .hooks[$ev] |= map(if any(.hooks[]?; stale) then (.hooks |= map(select(stale | not)) | select(.hooks | length > 0)) else . end) |
-    if any(.hooks[$ev][]?.hooks[]?; .command == $hook) then .
-    else .hooks[$ev] += [{"matcher": "", "hooks": [{"type": "command", "command": $hook, "timeout": 5}]}] end)'
 sl_install "$settings"
-echo "hooks and status line installed in $settings (backup: settings.json.zam.bak)"
+echo "status line installed in $settings (backup: settings.json.zam.bak)"

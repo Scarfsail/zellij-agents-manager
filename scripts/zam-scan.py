@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
-"""Discover running coding agents and the zellij pane each one lives in.
+"""Discover running coding agents and the zellij pane each one lives in, with what Zellij doesn't know about them.
 
-Prints a JSON array on stdout; the zellij plugin runs this on a timer.
+Prints a JSON array on stdout; the zellij plugin runs this on a timer. The agents' state (working, needs you, done,
+failed, idle) comes from Zellij itself (OSC 7501, Zellij 0.46), which the plugin reads; the scanner adds the extras
+(repo, branch, title, model, context, cost, usage) and, for Cursor, which reports no state, a guess.
 
-Claude Code: every interactive process writes ~/.claude/sessions/<pid>.json
-(status busy/idle/shell, cwd, name, startedAt). We keep the live ones, read
-ZELLIJ_SESSION_NAME / ZELLIJ_PANE_ID from /proc/<pid>/environ, take context
-usage from the tail of the transcript (window size from Claude's model catalog cache), and overlay the last hook event
-(written by zam-hook.sh) to detect "waiting for permission".
+Claude Code: every interactive process writes ~/.claude/sessions/<pid>.json (cwd, name, startedAt). We keep the live
+ones, read ZELLIJ_SESSION_NAME / ZELLIJ_PANE_ID from /proc/<pid>/environ and take context usage from the tail of the
+transcript (window size from Claude's model catalog cache). Its status line (--claude-statusline) records the cost in
+~/.cache/zellij-agents/claude/<session id>.status.json.
 
-Cursor CLI: found by its cmdline plus the ~/.cursor/chats/<hash>/<agentId>/store.db it keeps open.
-Busy/idle and the current tool come from Cursor hooks (--cursor-hook), context usage from its
-status line (--cursor-statusline); both write ~/.cache/zellij-agents/cursor/<agent pid>.json.
-Without hooks, a recently written store.db means busy.
+Cursor CLI: found by its cmdline plus the ~/.cursor/chats/<hash>/<agentId>/store.db it keeps open; working while
+store.db was written in the last few seconds. Context usage comes from its status line (--cursor-statusline), in
+~/.cache/zellij-agents/cursor/<agent pid>.json.
 
 Codex CLI: found by its native `codex` binary in /proc, linked to the newest `codex-tui` thread in
-~/.codex/state_5.sqlite with its cwd; busy/idle, context and the account's 5h/week limits come from that
-thread's rollout log. Codex hooks (--codex-hook) add "waiting for approval" and the current tool,
-in ~/.cache/zellij-agents/codex/<thread id>.json.
+~/.codex/state_5.sqlite with its cwd; context and the account's 5h/week limits come from that thread's rollout log.
 
-agy (Antigravity CLI): found by its `agy` binary in /proc. Its status line (--agy-statusline) gives busy/idle,
-"waiting for confirmation", title, model, context, cost and quota, in ~/.cache/zellij-agents/agy/<agent pid>.json
-and usage/agy.json. Without it, a recently written conversation db the process has open means busy.
+agy (Antigravity CLI): found by its `agy` binary in /proc. Its status line (--agy-statusline) gives the title, model,
+context, cost and quota, in ~/.cache/zellij-agents/agy/<agent pid>.json and usage/agy.json.
+
+Notifications (--native '<json>'): the bar passes Zellij's agent states; entering needs you, done or failed notifies
+once across all bars, unless the agent is muted in Zellij.
 
 Account usage (--fetch-usage): Claude's /usage numbers from api.anthropic.com/api/oauth/usage with the
 local login token, cached in ~/.cache/zellij-agents/usage/claude.json and refreshed in the background.
@@ -43,23 +43,21 @@ import time
 HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(HOME, ".claude"))
 HOOK_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.join(HOME, ".cache")), "zellij-agents", "claude")
-# "read" marks for questions: <session_id> holds the status_since of the question the user has looked at
-SEEN_DIR = os.path.join(os.path.dirname(HOOK_DIR), "seen")
-# last status seen per agent id, plus <id>@<status>@<since> claims so only one bar notifies per transition
+# last status seen per <session>:<pane>, plus <session>:<pane>@<status>@<since> claims so only one bar notifies per
+# transition
 NOTIFY_DIR = os.path.join(os.path.dirname(HOOK_DIR), "notify")
 CURSOR_DIR = os.path.join(os.path.dirname(HOOK_DIR), "cursor")
 CURSOR_CHATS = os.path.join(HOME, ".cursor", "chats")
 CODEX_DIR = os.path.join(os.path.dirname(HOOK_DIR), "codex")
 CODEX_HOME = os.environ.get("CODEX_HOME", os.path.join(HOME, ".codex"))
 AGY_DIR = os.path.join(os.path.dirname(HOOK_DIR), "agy")
-AGY_HOME = os.path.join(HOME, ".gemini", "antigravity-cli")
 USAGE_DIR = os.path.join(os.path.dirname(HOOK_DIR), "usage")
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 # refetch account usage when the cache is older than this; a running fetch blocks another for FETCH_WAIT_S
 USAGE_MAX_AGE_S = 60
 FETCH_WAIT_S = 30
 TAIL_BYTES = 256 * 1024
-# Without Cursor hooks or the agy status line, an agent is busy while its chat db was written within this many seconds
+# A Cursor agent is working while its chat db was written within this many seconds
 ACTIVITY_BUSY_WINDOW_S = 4
 # Windows toast for WSL; skipped while the terminal (ZAM_TERM) is the foreground app.
 # Text comes in via env and goes through CreateTextNode, so it is never parsed as script or XML.
@@ -75,27 +73,9 @@ $m::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShel
 """
 
 
-def seen_ts(sid):
-    try:
-        with open(os.path.join(SEEN_DIR, sid)) as f:
-            return int(f.read().strip() or 0)
-    except (OSError, ValueError):
-        return 0
-
-
 def safe_id(sid):
     """usable as a file name in our cache dirs"""
     return bool(sid) and "/" not in sid and not sid.startswith(".")
-
-
-def mark_seen(sid, ts):
-    if not safe_id(sid):
-        return
-    os.makedirs(SEEN_DIR, exist_ok=True)
-    tmp = os.path.join(SEEN_DIR, f".{sid}.tmp")
-    with open(tmp, "w") as f:
-        f.write(str(int(ts)))
-    os.replace(tmp, os.path.join(SEEN_DIR, sid))
 
 
 def write_json(path, obj):
@@ -331,13 +311,25 @@ def transcript_info(path):
     return info
 
 
-def hook_state(session_id, suffix=""):
-    """last hook event (<sid>.json), or with suffix ".status" the status line's record (<sid>.status.json)"""
+def claude_status(session_id):
+    """the status line's record of a session (<sid>.status.json)"""
     try:
-        with open(os.path.join(HOOK_DIR, f"{session_id}{suffix}.json")) as f:
+        with open(os.path.join(HOOK_DIR, f"{session_id}.status.json")) as f:
             return json.load(f)
     except (OSError, ValueError):
         return None
+
+
+def claude_prune(live):
+    """drop the status line records of sessions no longer running, and the event files older versions' hooks wrote
+    (<sid>.json); a record written in the last minute stays, its session file may not be there yet"""
+    for path in glob.glob(os.path.join(HOOK_DIR, "*.json")):
+        age = _age_s(path)
+        if os.path.basename(path).split(".")[0] not in live and age is not None and age > 60:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 _WINDOWS = None
@@ -381,7 +373,7 @@ def context_window(model):
 
 
 def claude_agents():
-    out = []
+    out, live = [], set()
     for path in glob.glob(os.path.join(CLAUDE_DIR, "sessions", "*.json")):
         try:
             with open(path) as f:
@@ -393,22 +385,10 @@ def claude_agents():
             continue
         if s.get("procStart") and proc_start(pid) != str(s["procStart"]):
             continue  # dead, or pid reused
+        live.add(s.get("sessionId"))  # before the environ check: a record is pruned only once its session ends
         env = proc_env(pid)
         if env is None:
             continue
-        status = s.get("status", "unknown")
-        status_ts = s.get("statusUpdatedAt") or s.get("updatedAt") or 0
-        detail = ""
-        hs = hook_state(s.get("sessionId", ""))
-        if hs:
-            ev = hs.get("event")
-            asks = ev == "PermissionRequest" or (ev == "Notification" and hs.get("notification_type") == "permission_prompt")
-            # stale if Claude's own status changed after the prompt (e.g. user hit Esc)
-            if asks and hs.get("ts", 0) >= status_ts:
-                status, detail = "needs_input", hs.get("message") or hs.get("tool") or "permission"
-                status_ts = max(status_ts, hs.get("ts", 0))
-            elif ev in ("PreToolUse", "PostToolUse") and status == "busy":
-                detail = hs.get("tool") or ""
         a = {
             "kind": "claude",
             "pid": pid,
@@ -416,14 +396,13 @@ def claude_agents():
             "name": s.get("name") or os.path.basename(s.get("cwd", "")),
             "cwd": s.get("cwd"),
             "started_at": s.get("startedAt", 0),
-            "status": status,
-            "status_since": status_ts,
-            # the user has focused this agent since the current question arrived
-            "seen": status == "needs_input" and seen_ts(s.get("sessionId", "")) >= status_ts,
-            "detail": detail,
+            # the state is Zellij's (OSC 7501); a Claude Code that doesn't report it shows idle
+            "status": "idle",
+            "status_since": s.get("startedAt", 0),
+            "detail": "",
             **pane_fields(pid, env),
             "version": s.get("version"),
-            "cost_usd": (hook_state(s.get("sessionId", ""), ".status") or {}).get("cost_usd"),
+            "cost_usd": (claude_status(s.get("sessionId", "")) or {}).get("cost_usd"),
         }
         a.update(transcript_info(transcript_path(s.get("cwd", ""), s.get("sessionId", ""))))
         win = context_window(a.get("model"))
@@ -437,6 +416,7 @@ def claude_agents():
             # same as Claude Code's statusline used_percentage (MIr): round, clamp 0..100
             a["ctx_pct"] = min(100, max(0, round(a["ctx_tokens"] / win * 100)))
         out.append(a)
+    claude_prune(live)
     return out
 
 
@@ -470,10 +450,8 @@ def agent_state(state_dir, pid):
     return st if isinstance(st, dict) and st.get("proc_start") == proc_start(pid) else {}  # else pid reused
 
 
-def agent_update(state_dir, is_kind, fields, phase=None):
-    """merge fields into the state file (state_dir/<pid>.json) of the agent this command runs under; None deletes it.
-    With phase(state) (busy/idle), "since" becomes fields["ts"] when the phase changes, so a long busy turn keeps
-    its age across tool calls"""
+def agent_update(state_dir, is_kind, fields):
+    """merge fields into the state file (state_dir/<pid>.json) of the agent this status line runs under"""
     pid = agent_pid(is_kind)
     if not pid:
         return
@@ -481,17 +459,8 @@ def agent_update(state_dir, is_kind, fields, phase=None):
     path = os.path.join(state_dir, f"{pid}.json")
     lock = os.open(state_dir, os.O_RDONLY)
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX)  # hooks and the status line run concurrently
-        if fields is None:
-            if os.path.exists(path):
-                os.remove(path)
-            return
+        fcntl.flock(lock, fcntl.LOCK_EX)  # status line runs may overlap
         st = agent_state(state_dir, pid)
-        if phase and ("since" not in st or phase({**st, **fields}) != phase(st)):
-            # busy again after needs_input: just after the request, not now, so the age after an approval
-            # counts from the request and a later request in the turn is still a new transition
-            back = phase(st) == "needs_input" and phase({**st, **fields}) == "busy"
-            fields["since"] = st["since"] + 1 if back and "since" in st else fields["ts"]
         st.update(fields, proc_start=proc_start(pid))
         tmp = os.path.join(state_dir, f".{pid}.tmp")
         with open(tmp, "w") as f:
@@ -499,20 +468,6 @@ def agent_update(state_dir, is_kind, fields, phase=None):
         os.replace(tmp, path)
     finally:
         os.close(lock)
-
-
-def cursor_hook():
-    # never block Cursor or deny a tool: no stdout, no errors
-    try:
-        h = json.load(sys.stdin)
-        ev = h.get("hook_event_name")
-        if ev == "sessionEnd":
-            agent_update(CURSOR_DIR, is_cursor, None)
-        else:
-            fields = {"event": ev, "tool": h.get("tool_name") or "", "ts": int(time.time() * 1000)}
-            agent_update(CURSOR_DIR, is_cursor, fields, lambda st: st.get("event") in CURSOR_BUSY)
-    except BaseException:
-        pass
 
 
 def cursor_statusline(chain):
@@ -555,11 +510,8 @@ def claude_statusline(chain):
     run_chain(chain, data)
 
 
-CURSOR_BUSY = ("beforeSubmitPrompt", "preToolUse", "postToolUse", "postToolUseFailure")
-
-
 def agent_prune(state_dir):
-    """drop state files of agents killed before they removed their own (Cursor's sessionEnd hook), or never do (agy)"""
+    """drop state files of agents no longer running (status line records are never removed by the agent)"""
     try:
         lock = os.open(state_dir, os.O_RDONLY)
     except OSError:
@@ -611,16 +563,9 @@ def cursor_agents():
             m.pop("blobEncryptionKey", None)  # credential: never let it reach the output
             cwd = meta.get("cwd") or ""
             st = agent_state(CURSOR_DIR, pid)
-            detail = ""
-            hooked = st.get("event") == "stop" or st.get("event") in CURSOR_BUSY
-            if st.get("event") == "stop":
-                status, status_ts = "idle", st.get("since", st.get("ts", 0))
-            elif st.get("event") in CURSOR_BUSY:
-                status, status_ts = "busy", st.get("since", st.get("ts", 0))
-                detail = st.get("tool", "") if st["event"] != "beforeSubmitPrompt" else ""
-            else:
-                mt = db_mtime(db)
-                status, status_ts = ("busy" if time.time() - mt < ACTIVITY_BUSY_WINDOW_S else "idle"), int(mt * 1000)
+            # Cursor reports no state to Zellij: guessed from its chat db's writes
+            mt = db_mtime(db)
+            status, status_ts = ("working" if time.time() - mt < ACTIVITY_BUSY_WINDOW_S else "idle"), int(mt * 1000)
             name = m.get("name") or ""
             a = {
                 "kind": "cursor",
@@ -631,9 +576,7 @@ def cursor_agents():
                 "started_at": proc_started_ms(pid),
                 "status": status,
                 "status_since": status_ts,
-                "seen": False,
-                "detail": detail,
-                "hooked": hooked,  # status from hooks, not guessed from db writes: only then notify
+                "detail": "",
                 **pane_fields(pid, env),
                 "model": st.get("model") or m.get("lastUsedModel"),
                 # empty: the plugin falls back to the pane title
@@ -659,7 +602,6 @@ CODEX_OPT_VALUE = {
     b"-m", b"--model", b"-p", b"--profile", b"-s", b"--sandbox", b"-C", b"--cd", b"--add-dir", b"-a",
     b"--ask-for-approval",
 }
-CODEX_EVENTS = (b'"task_started"', b'"task_complete"', b'"turn_aborted"', b'"token_count"')
 # Codex's context % leaves out this many tokens of fixed prompt overhead, on both sides
 CODEX_BASELINE_TOKENS = 12000
 
@@ -705,28 +647,17 @@ def codex_query(sql, *args):
 
 
 def _scan_rollout(lines, info):
-    """Fill info from Codex rollout lines (newest first): the last turn start/end, context, account rate limits."""
+    """Fill info from Codex rollout lines (newest first): context, account rate limits."""
     for line in lines:
-        if "last_ts" not in info:  # the newest line: whether the turn moved on after a hook
-            m = re.match(rb'\{"timestamp":"([^"]+)"', line)
-            try:
-                info["last_ts"] = _epoch_ms(m[1].decode()) if m else 0
-            except ValueError:
-                info["last_ts"] = 0
-        if {"status", "ctx_tokens", "rate_limits"} <= info.keys():
+        if {"ctx_tokens", "rate_limits"} <= info.keys():
             break
-        if b'"event_msg"' not in line or not any(t in line for t in CODEX_EVENTS):
+        if b'"event_msg"' not in line or b'"token_count"' not in line:
             continue
         try:
-            d = json.loads(line)
-            p, typ, ts = d["payload"], d["payload"]["type"], _epoch_ms(d["timestamp"])
+            p = json.loads(line)["payload"]
         except (ValueError, KeyError, TypeError):
             continue
-        if typ in ("task_started", "task_complete", "turn_aborted") and "status" not in info:
-            # turn_aborted: the user pressed Esc, no task_complete follows
-            info["status"] = "busy" if typ == "task_started" else "idle"
-            info["status_since"] = ts
-        elif typ == "token_count":
+        if p.get("type") == "token_count":
             usage = (p.get("info") or {}).get("last_token_usage")
             if usage and "ctx_tokens" not in info:
                 info["ctx_tokens"], info["ctx_size"] = usage.get("total_tokens"), p["info"].get("model_context_window")
@@ -735,72 +666,14 @@ def _scan_rollout(lines, info):
                 info["rate_limits"] = rl
 
 
-def rollout_info(path, thread_id=None):
-    """from the rollout's tail only; with thread_id, a last turn event older than the tail (a turn that logged
-    more than TAIL_BYTES) is kept in CODEX_DIR/<thread id>.turn.json with the byte offset read up to, so each
-    scan reads only what the rollout gained since (the whole file the first time)"""
-    info = tail_scan(path, _scan_rollout, lambda i: True) if path else {}
-    if not (path and thread_id) or "status" in info or os.path.getsize(path) <= TAIL_BYTES:
-        return info
-    cache = os.path.join(CODEX_DIR, f"{thread_id}.turn.json")
-    try:
-        with open(cache) as f:
-            c = json.load(f)
-    except (OSError, ValueError):
-        c = None
-    if not (isinstance(c, dict) and c.get("rollout") == path and isinstance(c.get("offset"), int)):
-        c = {"rollout": path, "offset": 0}
-    try:
-        with open(path, "rb") as f:
-            off = c["offset"] if c["offset"] <= f.seek(0, 2) else 0
-            f.seek(off)
-            new = f.read()
-    except OSError:
-        return info
-    end = new.rfind(b"\n") + 1  # a line still being written is read next time
-    if end:
-        turn = {}
-        _scan_rollout(reversed(new[:end].splitlines()), turn)
-        if "status" in turn:
-            c.update(status=turn["status"], status_since=turn["status_since"])
-        c["offset"] = off + end
-        write_json(cache, c)
-    if "status" in c:
-        info.update(status=c["status"], status_since=c["status_since"])
-    return info
-
-
-def codex_state(thread_id):
-    try:
-        with open(os.path.join(CODEX_DIR, f"{thread_id}.json")) as f:
-            st = json.load(f)
-    except (OSError, ValueError):
-        return {}
-    return st if isinstance(st, dict) else {}
-
-
-def codex_hook():
-    # never block Codex: no stdout, no errors. Hooks run in Codex's shared app-server daemon, so the
-    # state is keyed by the thread (session_id), not by a parent pid
-    try:
-        h = json.load(sys.stdin)
-        sid = h.get("session_id") or ""
-        if not safe_id(sid):
-            return
-        path = os.path.join(CODEX_DIR, f"{sid}.json")
-        if h.get("hook_event_name") == "SessionEnd":
-            os.remove(path)
-        else:
-            ev, now = h.get("hook_event_name"), int(time.time() * 1000)
-            # keep the last request's time: later tool events overwrite the rest
-            asked = now if ev == "PermissionRequest" else codex_state(sid).get("asked_ts", 0)
-            write_json(path, {"event": ev, "tool": h.get("tool_name") or "", "ts": now, "asked_ts": asked})
-    except BaseException:
-        pass
+def rollout_info(path):
+    """context and rate limits from the rollout's tail"""
+    return tail_scan(path, _scan_rollout, lambda i: True) if path else {}
 
 
 def codex_prune(live):
-    """drop hook state of threads no running TUI links to, after a day (killed before SessionEnd, or not a TUI)"""
+    """drop the files older versions wrote per thread (hook events, turn caches) once no running TUI links to it, after
+    a day"""
     for path in glob.glob(os.path.join(CODEX_DIR, "*.json")):
         age = _age_s(path)
         if os.path.basename(path).split(".")[0] not in live and age is not None and age > 86400:
@@ -835,20 +708,9 @@ def codex_agents():
                     started,
                 )
                 tid, cwd, title, branch, model, rollout = rows[0] if rows else (None, cwd, "", None, None, None)
-                info, st = rollout_info(rollout, tid), codex_state(tid) if tid else {}
+                info = rollout_info(rollout)
             except Exception:  # unreadable or changed state db: list it unlinked, like a TUI with no thread yet
-                tid, title, branch, model, info, st = None, "", None, None, {}, {}
-            status, status_ts = info.get("status", "idle"), info.get("status_since", started)
-            detail, hook_ts = "", st.get("ts", 0)
-            # a rollout line after the request: approved (or denied), the turn goes on
-            if st.get("event") == "PermissionRequest" and hook_ts > status_ts and info.get("last_ts", 0) <= hook_ts:
-                status, status_ts, detail = "needs_input", hook_ts, st.get("tool") or "permission"
-            elif status == "busy":
-                if st.get("event") == "PreToolUse" and hook_ts > status_ts:
-                    detail = st.get("tool") or ""
-                asked = _int(st.get("asked_ts")) or 0
-                if asked > status_ts:
-                    status_ts = asked + 1  # busy again after a request in this turn, so the next one is new
+                tid, title, branch, model, info = None, "", None, None, {}
             a = {
                 "kind": "codex",
                 "pid": pid,
@@ -856,10 +718,10 @@ def codex_agents():
                 "name": os.path.basename(cwd),
                 "cwd": cwd,
                 "started_at": started,
-                "status": status,
-                "status_since": status_ts,
-                "seen": status == "needs_input" and seen_ts(tid) >= status_ts,
-                "detail": detail,
+                # the state is Zellij's (OSC 7501); a Codex older than 0.163 shows idle
+                "status": "idle",
+                "status_since": started,
+                "detail": "",
                 **pane_fields(pid, env),
                 "title": title or "",  # empty: the plugin falls back to the pane title
                 "branch": branch,
@@ -906,8 +768,6 @@ AGY_NON_TUI = {
 }
 # print mode, and the self-updater agy starts in the background
 AGY_NON_TUI_OPTS = {b"p", b"print", b"prompt", b"bg-updater"}
-# agent_state values that mean a turn is running; "reviewing" waits for the user to review a plan
-AGY_BUSY = ("working", "tool_use")
 # agy's quota bucket ids (agy 1.5.9 /usage): "3p" is its "Claude and GPT models" group
 AGY_BUCKETS = {
     "gemini-5h": "gemini 5h", "gemini-weekly": "gemini week", "gemini-argon-wtu-weekly": "argon week",
@@ -932,11 +792,6 @@ def is_agy(pid):
     return not any(a.startswith(b"-") and a.lstrip(b"-").split(b"=")[0] in AGY_NON_TUI_OPTS for a in argv[1:])
 
 
-def agy_status(st):
-    """busy / idle / needs_input from the status line's last record"""
-    return "needs_input" if st.get("asks") else "busy" if st.get("state") in AGY_BUSY else "idle"
-
-
 def agy_statusline(chain):
     data = sys.stdin.buffer.read()
     try:
@@ -950,11 +805,9 @@ def agy_statusline(chain):
             "ctx_size": cw.get("context_window_size"),
             "ctx_tokens": cw.get("total_input_tokens"),
             "cost_usd": (p.get("cost") or {}).get("total_usd"),
-            "state": p.get("agent_state"),
-            "asks": bool(p.get("tool_confirmation_pending")),
             "ts": int(time.time() * 1000),
         }  # None too: a new conversation clears the old values
-        agent_update(AGY_DIR, is_agy, st, agy_status)
+        agent_update(AGY_DIR, is_agy, st)
         if p.get("quota"):
             write_json(os.path.join(USAGE_DIR, "agy.json"), p["quota"])
     except Exception:
@@ -983,7 +836,6 @@ def git_branch(cwd):
 
 def agy_agents():
     agent_prune(AGY_DIR)
-    convs = os.path.realpath(os.path.join(AGY_HOME, "conversations"))  # fd targets are resolved paths
     out = []
     for d in glob.glob("/proc/[0-9]*"):
         pid = int(d[6:])
@@ -995,27 +847,18 @@ def agy_agents():
                 continue
             cwd = os.readlink(f"{d}/cwd")
             st = agent_state(AGY_DIR, pid)
-            hooked = st.get("state") is not None  # agent_state is omitempty: a record without it is no status
-            if hooked:
-                status, status_ts = agy_status(st), st.get("since", st.get("ts", 0))
-            else:
-                # an old conversation's db can stay open after a resume or /clear: the newest one is current
-                mt = max(map(db_mtime, proc_open_files(pid, convs + "/", ".db")), default=0)
-                status = "busy" if time.time() - mt < ACTIVITY_BUSY_WINDOW_S else "idle"
-                status_ts = int(mt * 1000) if mt else proc_started_ms(pid)
-            aid = st.get("conversation_id") or f"agy-{pid}"
+            started = proc_started_ms(pid)
             a = {
                 "kind": "agy",
                 "pid": pid,
-                "id": aid,
+                "id": st.get("conversation_id") or f"agy-{pid}",
                 "name": os.path.basename(cwd),
                 "cwd": cwd,
-                "started_at": proc_started_ms(pid),
-                "status": status,
-                "status_since": status_ts,
-                "seen": status == "needs_input" and seen_ts(aid) >= status_ts,
-                "detail": "tool" if st.get("state") == "tool_use" else "",
-                "hooked": hooked,  # status from the status line, not guessed from db writes: only then notify
+                "started_at": started,
+                # the state is Zellij's (OSC 7501); an agy with AGY_CLI_OSC7501=off shows idle
+                "status": "idle",
+                "status_since": started,
+                "detail": "",
                 **pane_fields(pid, env),
                 "title": st.get("title") or "",  # empty: the plugin falls back to the pane title
                 "branch": git_branch(cwd),
@@ -1197,12 +1040,19 @@ def claude_usage():
         return None
 
 
-def notification_text(a):
-    kind = (a.get("kind") or "agent").capitalize()
-    asks = a.get("status") == "needs_input"
+# the states that notify, and how a notification's title says it
+NOTIFY_ON = {"needs_you": "needs you", "done": "finished", "failed": "failed"}
+
+
+def notification_text(n, a=None):
+    """title and body for Zellij's state n of an agent pane, named after the scanner's agent a in that pane if any
+    (the agent's own app name otherwise)"""
+    a = a or {}
+    kind = (a.get("kind") or n.get("app") or "agent").capitalize()
+    status = n.get("status")
     where = "@".join(p for p in (a.get("name"), a.get("branch")) if p)
-    body = " · ".join(p for p in (where, a.get("title"), asks and a.get("detail")) if p)
-    return f"{kind} needs you" if asks else f"{kind} finished", body
+    body = " · ".join(p for p in (where, n.get("title"), status != "done" and n.get("text")) if p)
+    return f"{kind} {NOTIFY_ON[status]}", body
 
 
 def send_notification(title, body):
@@ -1247,22 +1097,24 @@ def _int(v):
         return None
 
 
-def notify_transitions(agents):
-    """notify when an agent starts waiting or finishes its turn, once across all bars"""
+def notify_transitions(agents, native):
+    """notify when an agent pane enters needs you, done or failed in Zellij (native: the bar's
+    [{session, pane, status, since_ms, muted, app, title, text}]), once across all bars; never while muted"""
     try:
         os.makedirs(NOTIFY_DIR, exist_ok=True)
         files = os.listdir(NOTIFY_DIR)
     except OSError:
         return
+    by_pane = {(a.get("zellij_session"), a.get("pane_id")): a for a in agents}
     live, stale = set(), set()
-    for a in agents:
-        aid, status = str(a.get("id") or ""), a.get("status")
-        if not safe_id(aid):
+    for n in native:
+        key, status = f"{n.get('session')}:{n.get('pane')}", n.get("status")
+        if not safe_id(key):
             continue
-        live.add(aid)
-        since = _int(a.get("status_since"))
-        cur = f"{status} {a.get('status_since')}"
-        path = os.path.join(NOTIFY_DIR, aid)
+        live.add(key)
+        since = _int(n.get("since_ms"))
+        cur = f"{status} {n.get('since_ms')}"
+        path = os.path.join(NOTIFY_DIR, key)
         try:
             with open(path) as f:
                 prev = f.read()
@@ -1272,37 +1124,32 @@ def notify_transitions(agents):
             continue
         prev_status, _, prev_since = (prev or "").partition(" ")
         prev_since = _int(prev_since)
-        if since is not None and prev_since is not None and since < prev_since:
-            continue  # this bar's snapshot is older than the recorded state: never move it backwards
-        fire = (
-            prev is not None
-            and a.get("hooked", True)
-            and (
-                (status == "needs_input" and prev_status != "needs_input")
-                or (status == "idle" and prev_status in ("busy", "needs_input"))
-            )
-        )
-        claim = f"{aid}@{status}@{a.get('status_since')}"
+        if since and prev_since is not None and since < prev_since:
+            continue  # this bar's snapshot is older than the recorded state: never move it backwards (0: no time)
+        # a new entry into the state: another status, or the same one again later (a second prompt, a second turn)
+        changed = status != prev_status or since != prev_since
+        fire = prev is not None and not n.get("muted") and status in NOTIFY_ON and changed
+        claim = f"{key}@{status}@{n.get('since_ms')}"
         try:
             if fire:
                 try:
                     os.close(os.open(os.path.join(NOTIFY_DIR, claim), os.O_CREAT | os.O_EXCL | os.O_WRONLY))
-                    send_notification(*notification_text(a))
+                    send_notification(*notification_text(n, by_pane.get((n.get("session"), n.get("pane")))))
                 except FileExistsError:
                     pass  # another bar got there first
-            tmp = os.path.join(NOTIFY_DIR, f".{aid}.{os.getpid()}.tmp")
+            tmp = os.path.join(NOTIFY_DIR, f".{key}.{os.getpid()}.tmp")
             with open(tmp, "w") as f:
                 f.write(cur)
             os.replace(tmp, path)
         except OSError:
             continue
-        # claims of this agent's older transitions
-        for n in files:
-            parts = n.rsplit("@", 2)
-            if len(parts) == 3 and parts[0] == aid and since is not None:
+        # claims of this pane's older transitions
+        for f in files:
+            parts = f.rsplit("@", 2)
+            if len(parts) == 3 and parts[0] == key and since is not None:
                 cs = _int(parts[2])
                 if cs is not None and cs < since:
-                    stale.add(n)
+                    stale.add(f)
     # files of agents not seen for a day, and tmp files left by a killed scan; a single missed scan drops nothing
     for n in files:
         if n.startswith("."):
@@ -1321,13 +1168,12 @@ def notify_transitions(agents):
 
 
 def main():
-    if len(sys.argv) >= 4 and sys.argv[1] == "--seen":
-        mark_seen(sys.argv[2], sys.argv[3])
+    # older versions' hooks and seen marks: no-ops until the next release, so a config that still has them never errors
+    if sys.argv[1:2] in (["--cursor-hook"], ["--codex-hook"]):
+        sys.stdin.read()
         return
-    if sys.argv[1:2] == ["--cursor-hook"]:
-        return cursor_hook()
-    if sys.argv[1:2] == ["--codex-hook"]:
-        return codex_hook()
+    if sys.argv[1:2] == ["--seen"]:
+        return
     chain = " ".join(sys.argv[3:] if sys.argv[2:3] == ["--"] else sys.argv[2:])
     if sys.argv[1:2] == ["--cursor-statusline"]:
         return cursor_statusline(chain)
@@ -1339,9 +1185,9 @@ def main():
         return fetch_usage()
     agents = claude_agents() + cursor_agents() + codex_agents() + agy_agents()
     agents.sort(key=lambda a: a.get("started_at", 0))
-    if "--notify" in sys.argv:
+    if "--native" in sys.argv[:-1]:
         try:
-            notify_transitions(agents)
+            notify_transitions(agents, json.loads(sys.argv[sys.argv.index("--native") + 1]))
         except Exception:
             pass  # notifications must never cost the bar its output
     usage = {k: u for k, u in (("claude", claude_usage()), ("codex", codex_usage()), ("agy", agy_usage())) if u}

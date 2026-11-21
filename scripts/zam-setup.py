@@ -168,14 +168,19 @@ def json_commands(o):
             yield from json_commands(v)
 
 
-def part_state(path, markers, ours):
-    """'installed' / 'stale' / 'missing': our command in a settings file, found by the scripts' patterns; stale while
-    any of them points elsewhere (another checkout)"""
+def found_commands(path, markers):
+    """our commands in a settings file, found by the scripts' patterns"""
     try:
         with open(path) as f:
-            found = [s for s in json_commands(json.load(f)) if all(m in s for m in markers)]
+            return [s for s in json_commands(json.load(f)) if all(m in s for m in markers)]
     except (OSError, ValueError):
-        return "missing"
+        return []
+
+
+def part_state(path, markers, ours):
+    """'installed' / 'stale' / 'missing': our command in a settings file; stale while any of them points elsewhere
+    (another checkout)"""
+    found = found_commands(path, markers)
     if not found:
         return "missing"
     return "installed" if all(s == ours or s.startswith(ours + " ") for s in found) else "stale"
@@ -189,19 +194,19 @@ def agents():
     agy = os.path.join(home, ".gemini", "antigravity-cli")
     scan = lambda flag: f"python3 {shq(SCAN)} --{flag}"
     zam = lambda flag: ("zam-scan.py", "--" + flag)
-    # name, binary, config dir, script, [(part, file, markers, our command)], whether its --version may be run:
-    # cursor-agent's rewrites ~/.cursor/cli-config.json, which holds our status line
+    # name, binary, config dir, script, [(part, file, markers, our command)], the hooks older versions added (file,
+    # markers) or None, whether its --version may be run: cursor-agent's rewrites ~/.cursor/cli-config.json, which
+    # holds our status line
     return [
         ("Claude", "claude", claude, "install-hooks.sh", [
-            ("hooks", f"{claude}/settings.json", ("zam-hook.sh",), os.path.join(HERE, "scripts", "zam-hook.sh")),
-            ("status line", f"{claude}/settings.json", zam("claude-statusline"), scan("claude-statusline"))], True),
+            ("status line", f"{claude}/settings.json", zam("claude-statusline"), scan("claude-statusline"))],
+         (f"{claude}/settings.json", ("zam-hook.sh",)), True),
         ("Cursor", "cursor-agent", cursor, "install-cursor.sh", [
-            ("hooks", f"{cursor}/hooks.json", zam("cursor-hook"), scan("cursor-hook")),
-            ("status line", f"{cursor}/cli-config.json", zam("cursor-statusline"), scan("cursor-statusline"))], False),
-        ("Codex", "codex", codex, "install-codex.sh", [
-            ("hooks", f"{codex}/hooks.json", zam("codex-hook"), scan("codex-hook"))], True),
+            ("status line", f"{cursor}/cli-config.json", zam("cursor-statusline"), scan("cursor-statusline"))],
+         (f"{cursor}/hooks.json", zam("cursor-hook")), False),
+        ("Codex", "codex", codex, "install-codex.sh", [], (f"{codex}/hooks.json", zam("codex-hook")), True),
         ("agy", "agy", agy, "install-agy.sh", [
-            ("status line", f"{agy}/settings.json", zam("agy-statusline"), scan("agy-statusline"))], True),
+            ("status line", f"{agy}/settings.json", zam("agy-statusline"), scan("agy-statusline"))], None, True),
     ]
 
 
@@ -236,7 +241,7 @@ def read_state():
     st = State()
     out = cmd_out("zellij", "--version")
     st.zellij = out.split()[-1] if out and out.split() else None
-    probe = {"jq": True, **{a[1]: a[5] for a in agents()}}
+    probe = {"jq": True, **{a[1]: a[6] for a in agents()}}
     tools = {b: shutil.which(b) for b in probe}
     with concurrent.futures.ThreadPoolExecutor(len(tools)) as ex:  # the version probes concurrently, so they cost
         # one timeout at most (the zellij calls above and below run on their own, without one)
@@ -259,10 +264,12 @@ def read_state():
     st.binds = effective_binds(cfg) if st.zellij else parse_keybinds(cfg)[0]
     st.detected = detect_mod(st.binds)
     st.default_mod = st.detected or MODS[0]
-    st.agents = []  # (name, binary, its path or None, its version, config dir, config dir exists, script, part states)
-    for name, binary, cfg_home, script, parts, _ in agents():
+    # (name, binary, its path or None, its version, config dir, config dir exists, script, part states, old hooks found)
+    st.agents = []
+    for name, binary, cfg_home, script, parts, old, _ in agents():
         states = [(part, part_state(f, markers, ours)) for part, f, markers, ours in parts]
-        st.agents.append((name, binary, tools[binary], vers[binary], cfg_home, os.path.isdir(cfg_home), script, states))
+        st.agents.append((name, binary, tools[binary], vers[binary], cfg_home, os.path.isdir(cfg_home), script, states,
+                          bool(old and found_commands(*old))))
     return st
 
 
@@ -328,8 +335,8 @@ def rows(st):
     if st.zellij is None:
         r.append(info("zellij", [mark("bad", "not found"), note("needed for the layouts and jump keys")]))
     else:
-        old = tuple(int(x) for x in re.findall(r"\d+", st.zellij)[:2]) < (0, 45)
-        r.append(info("zellij", [mark("warn", st.zellij), note("needs 0.45 or newer", "warn")] if old
+        old = tuple(int(x) for x in re.findall(r"\d+", st.zellij)[:2]) < (0, 46)
+        r.append(info("zellij", [mark("bad", st.zellij), note("needs 0.46 or newer", "bad")] if old
                       else [mark("ok", st.zellij)]))
     r.append(info("jq", [mark("ok", st.jq_ver or "found"), note(tilde(st.jq))] if st.jq
                   else [mark("bad", "not found"), note("needed by every agent script")]))
@@ -364,22 +371,29 @@ def rows(st):
 
     r += [([], None), header("Supported agents")]
     part = {"installed": "ok", "missing": "dim", "stale": "warn"}
-    for name, binary, path, ver, cfg_home, cfg_found, script, states in st.agents:
+    needs_jq = [] if st.jq else [note("needs jq", "bad")]
+    for name, binary, path, ver, cfg_home, cfg_found, script, states, old_hooks in st.agents:
         if not (path or cfg_found):
             r.append(info(name, [mark("dim", f"not found: no {binary} on PATH, no {tilde(cfg_home)}")], dim=True))
             continue
-        if all(s == "missing" for _, s in states):
-            value, notes = [mark("dim", "not installed")], []
+        if not states:
+            r.append(info(name, [mark("ok", "no setup needed")]))
         else:
-            value = []
-            for p, s in states:
-                value += ([("  ", "")] if value else []) + [mark(part[s], p + (" stale: from another checkout"
-                                                                                if s == "stale" else ""))]
-            notes = [note("trust them once in Codex's /hooks", "")] if name == "Codex" else []
-        act = (lambda s, a=(name, script, states): act_agent(s, *a)) if st.jq else None
-        r.append(setting(name, value, act, notes + ([] if st.jq else [note("needs jq", "bad")])))
+            if all(s == "missing" for _, s in states):
+                value = [mark("dim", "not installed")]
+            else:
+                value = []
+                for p, s in states:
+                    value += ([("  ", "")] if value else []) + [mark(part[s], p + (" stale: from another checkout"
+                                                                                    if s == "stale" else ""))]
+            act = (lambda s, a=(name, script, states): act_agent(s, *a)) if st.jq else None
+            r.append(setting(name, value, act, needs_jq))
         tool = [mark("ok", ver or "found"), note(tilde(path))] if path else [mark("dim", f"{binary} not on PATH")]
         r.append(info("", tool + [note(("· config " if cfg_found else "· no config dir ") + tilde(cfg_home))]))
+        if old_hooks:  # agent state comes from Zellij now: the hooks older versions added only cost time
+            act = (lambda s, sc=script: run([[os.path.join(HERE, "scripts", sc), "--uninstall-hooks"]])) if st.jq else None
+            r.append(([("  " + "old ZAM hooks".ljust(LABEL), "warn"), mark("warn", "remove")]
+                      + ([(" ›", "value")] if act else needs_jq), act))
     return r
 
 
@@ -653,7 +667,7 @@ def main(argv):
             break
         changed |= bool(r[sel][1](st))
     if changed:
-        print("Changed: start a new Zellij session for the layout and restart running agents for their hooks.")
+        print("Changed: start a new Zellij session for the layout and restart running agents for their status lines.")
     return 0
 
 

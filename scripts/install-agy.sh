@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Wires zam-scan.py into agy, the Antigravity CLI (idempotent, keeps a .zam.bak of what it changes; --uninstall
-# undoes it): the status line in ~/.gemini/antigravity-cli/settings.json gives busy/idle, NEEDS YOU, title, model,
-# context %, COST and the usage line, chaining to your own status line command if you have one. When you have none,
-# it is stacked below agy's built-in one. Restart running agy agents afterwards. Listing them needs none of this.
+# undoes it): the status line in ~/.gemini/antigravity-cli/settings.json gives the title, model, context %, COST and
+# the usage line, chaining to your own status line command if you have one. When you have none, it is stacked below
+# agy's built-in one. Restart running agy agents afterwards. Listing them and their state need none of this.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 . "$here/zam-install-lib.sh"
