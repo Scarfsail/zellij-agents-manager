@@ -1,6 +1,6 @@
 """setup.sh / scripts/zam-setup.py and the install scripts it drives: python3 -m unittest discover tests
 Everything runs against temp dirs (HOME, ZELLIJ_CONFIG_DIR, CLAUDE_CONFIG_DIR, CODEX_HOME), with a fake zellij on PATH
-that prints the dumps in tests/fixtures (taken from zellij 0.45.1)."""
+that prints the dumps in tests/fixtures (taken from zellij 0.45.1) and reports itself as 0.46.0."""
 import contextlib
 import importlib.util
 import json
@@ -25,7 +25,7 @@ REAL_RUN = subprocess.run
 
 FAKE_ZELLIJ = f"""#!/bin/sh
 case "$*" in
-  --version) echo "zellij 0.45.1" ;;
+  --version) echo "zellij ${{FAKE_ZELLIJ_VERSION:-0.46.0}}" ;;
   "setup --dump-config") cat "{FIX}/dump-config.kdl" ;;
   "setup --dump-layout default") cat "{FIX}/default.kdl" ;;
   "setup --dump-swap-layout default") cat "{FIX}/default.swap.kdl" ;;
@@ -142,9 +142,14 @@ class SetupTest(unittest.TestCase):
         self.assertEqual(s["notify"], "[✓ on]  (default)  install the layouts first")
         self.assertEqual(s["Claude"], "[○ not installed] ›")
         self.assertEqual(s["Claude tool"], "○ claude not on PATH  · config ~/claude")
-        self.assertEqual(s["Codex"], "[○ not installed] ›")
+        self.assertEqual(s["Codex"], "✓ no setup needed")
         self.assertEqual(s["Cursor"], "○ not found: no cursor-agent on PATH, no ~/.cursor")
-        self.assertEqual(s["zellij"], "✓ 0.45.1")
+        self.assertEqual(s["zellij"], "✓ 0.46.0")
+        self.assertNotIn("old ZAM hooks", s)
+
+    def test_zellij_too_old(self):
+        self.env["FAKE_ZELLIJ_VERSION"] = "0.45.1"
+        self.assertEqual(self.status()["zellij"], "✗ 0.45.1  needs 0.46 or newer")
 
     def test_mod_and_opts_survive_rerun(self):
         self.sh("scripts/install.sh", "--mod", "Alt", "--opt", "notify=false", "--opt", "debug_dump=/tmp/f")
@@ -382,54 +387,79 @@ class SetupTest(unittest.TestCase):
             "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "/x/guard.sh"}]}],
                       "Stop": []},
             "statusLine": {"type": "command", "command": "echo it's me", "padding": 0}}})
-        self.assertEqual(s, "[✓ hooks  ✓ status line] ›")
+        self.assertEqual(s, "[✓ status line] ›")
 
-    def test_claude_stale_hooks_replaced(self):
+    OLD_HOOK = {"type": "command", "command": "/old/checkout/scripts/zam-hook.sh", "timeout": 5}
+
+    def old_hooks_removed(self, path, mine, ours, events):
+        """the hooks older versions added (ours, in each of events, beside the user's own `mine`) show the old-hooks
+        row; --uninstall-hooks takes them out, leaving the file as it was before them"""
+        original = self.write_json(path, mine)
+        with_ours = json.loads(original)
+        for ev in events:
+            with_ours.setdefault("hooks", {}).setdefault(ev, []).append(ours)
+        self.write_json(path, with_ours)
+        self.assertEqual(self.status()["old ZAM hooks"], "⚠ remove ›")
+        st = zs.read_state()
+        row = next(a for segs, a in zs.rows(st) if segs and segs[0][0].strip() == "old ZAM hooks")
+        with self.backends() as run:
+            row(st)
+        self.assertEqual([c[0][0][1:] for c in run.call_args_list], [["--uninstall-hooks"]])
+        with open(path) as f:
+            self.assertEqual(f.read(), original)
+        self.assertNotIn("old ZAM hooks", self.status())
+
+    def test_claude_old_hooks(self):
         p = f"{self.claude}/settings.json"
-        old = "/old/checkout/scripts/zam-hook.sh"
-        self.write_json(p, {"permissions": {"allow": ["Bash(scripts/zam-hook.sh:*)"]}, "hooks": {
-            "Stop": [{"matcher": "", "hooks": [{"type": "command", "command": "/x/mine.sh"},
-                                               {"type": "command", "command": old, "timeout": 5}]}],
-            "SessionEnd": [{"matcher": "", "hooks": [{"type": "command", "command": old, "timeout": 5}]}]}})
-        self.sh("scripts/install-hooks.sh")
+        mine = {"hooks": {"Stop": [{"matcher": "", "hooks": [{"type": "command", "command": "/x/a.sh"}]}]}}
+        self.sh("scripts/install-hooks.sh")  # the status line stays when only the hooks go
+        with open(p) as f:
+            mine.update(json.load(f))
+        self.old_hooks_removed(p, mine, {"matcher": "", "hooks": [self.OLD_HOOK]},
+                               ["Stop", "PreToolUse", "SessionEnd"])
+        self.assertEqual(self.status()["Claude"], "[✓ status line] ›")
+        # --uninstall takes the old hooks out too
         with open(p) as f:
             s = json.load(f)
-        h = zs.os.path.join(ROOT, "scripts", "zam-hook.sh")
-        self.assertNotIn(old, json.dumps(s))
-        self.assertEqual(s["hooks"]["Stop"][0]["hooks"], [{"type": "command", "command": "/x/mine.sh"}])
-        self.assertEqual([g["hooks"][0]["command"] for g in s["hooks"]["SessionEnd"]], [h])
-        self.assertEqual(self.status()["Claude"], "[✓ hooks  ✓ status line] ›")
-        # an old hook beside the current one is stale, not installed
-        s["hooks"]["Stop"].append({"matcher": "", "hooks": [{"type": "command", "command": old}]})
+        s["hooks"]["Stop"][0]["hooks"].append(self.OLD_HOOK)
         self.write_json(p, s)
-        self.assertEqual(self.status()["Claude"], "[⚠ hooks stale: from another checkout  ✓ status line] ›")
-
-    def test_claude_fresh_install_unchanged(self):
-        # the stale-hook pass leaves a first install as it was: one group per event, appended
-        p = f"{self.claude}/settings.json"
-        self.write_json(p, {"hooks": {"Stop": [{"matcher": "", "hooks": [{"type": "command", "command": "/x/a.sh"}]}]}})
-        self.sh("scripts/install-hooks.sh")
+        self.sh("scripts/install-hooks.sh", "--uninstall")
         with open(p) as f:
-            s = json.load(f)
-        h = os.path.join(ROOT, "scripts", "zam-hook.sh")
-        ours = [{"matcher": "", "hooks": [{"type": "command", "command": h, "timeout": 5}]}]
-        self.assertEqual(s["hooks"]["Stop"], [{"matcher": "", "hooks": [{"type": "command", "command": "/x/a.sh"}]}] + ours)
-        self.assertEqual(list(s["hooks"]), ["Stop", "PreToolUse", "PostToolUse", "PermissionRequest", "Notification",
-                                            "UserPromptSubmit", "SessionEnd"])
-        self.assertTrue(all(s["hooks"][e] == ours for e in s["hooks"] if e != "Stop"))
+            self.assertEqual(json.load(f), {"hooks": {"Stop": [{"matcher": "", "hooks": [{"type": "command", "command": "/x/a.sh"}]}]}})
+
+    def test_old_zam_hook_is_a_no_op(self):
+        out = subprocess.run(["scripts/zam-hook.sh"], input='{"session_id": "x", "hook_event_name": "Stop"}', cwd=ROOT,
+                             env=self.env, capture_output=True, text=True)
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""))
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".cache")))
+        for flag in ("--codex-hook", "--cursor-hook"):
+            out = subprocess.run(["python3", "-I", "scripts/zam-scan.py", flag], input="{}", cwd=ROOT, env=self.env,
+                                 capture_output=True, text=True)
+            self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""))
 
     def test_claude_without_hooks(self):
         self.agent_roundtrip("install-hooks.sh", "Claude", {f"{self.claude}/settings.json": {"env": {"A": "1"}}})
 
     def test_cursor(self):
-        self.agent_roundtrip("install-cursor.sh", "Cursor", {
+        s = self.agent_roundtrip("install-cursor.sh", "Cursor", {
             f"{self.home}/.cursor/hooks.json": {"version": 1, "hooks": {"stop": [{"command": "/x/mine.sh"}]}},
             f"{self.home}/.cursor/cli-config.json": {"editor": {"vimMode": True}}})
+        self.assertEqual(s, "[✓ status line] ›")
+
+    def test_cursor_old_hooks(self):
+        self.old_hooks_removed(f"{self.home}/.cursor/hooks.json",
+                               {"version": 1, "hooks": {"stop": [{"command": "/x/mine.sh"}]}},
+                               {"command": f"python3 '{ROOT}/scripts/zam-scan.py' --cursor-hook"}, ["stop", "preToolUse"])
 
     def test_codex(self):
-        s = self.agent_roundtrip("install-codex.sh", "Codex", {f"{self.codex}/hooks.json": {
-            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/x/n.sh"}]}]}}})
-        self.assertIn("/hooks", s)
+        os.makedirs(self.codex)
+        self.sh("scripts/install-codex.sh")
+        self.assertEqual(os.listdir(self.codex), [])  # nothing to install
+        self.assertEqual(self.status()["Codex"], "✓ no setup needed")
+        hook = {"type": "command", "command": f"python3 '{ROOT}/scripts/zam-scan.py' --codex-hook", "timeout": 5}
+        self.old_hooks_removed(f"{self.codex}/hooks.json",
+                               {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/x/n.sh"}]}]}},
+                               {"matcher": "", "hooks": [hook]}, ["Stop", "PermissionRequest"])
 
     def test_agy(self):
         self.agent_roundtrip("install-agy.sh", "agy",
@@ -525,10 +555,10 @@ class SetupTest(unittest.TestCase):
 
     def test_status_colors(self):
         self.assertNotIn("\x1b", self.sh("./setup.sh", "--status"))  # piped: plain text
-        self.assertIn("\x1b[32m✓ 0.45.1\x1b[0m", self.tty_status())
+        self.assertIn("\x1b[32m✓ 0.46.0\x1b[0m", self.tty_status())
         plain = self.tty_status(NO_COLOR="1")
         self.assertNotIn("\x1b", plain)
-        self.assertIn("✓ 0.45.1", plain)
+        self.assertIn("✓ 0.46.0", plain)
 
     def test_agent_tools_found(self):
         claude = self.fake_bin("claude", 'echo "9.8.7 (Claude Code)"; echo more')

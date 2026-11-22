@@ -69,8 +69,6 @@ struct Agent {
     model: Option<String>,
     /// session cost so far, from Claude's status line
     cost_usd: Option<f64>,
-    /// the current question was already looked at (scanner's shared "read" mark)
-    seen: bool,
 }
 
 // ---------- plugin state ----------
@@ -81,16 +79,37 @@ enum Mode {
     Panel,
 }
 
+#[derive(Default)]
 struct Row {
+    /// the scanner's agent, its status, status_since and detail replaced by Zellij's when `native`
     agent: Agent,
     tab_pos: Option<usize>,
     pane_title: String,
     local: bool,
     focused: bool,
-    /// waiting on you, but you have already focused it since the question came in
+    /// the status comes from Zellij's attention data (OSC 7501), not the scanner's guess (Cursor)
+    native: bool,
+    /// Zellij marked the pane seen since its status changed
     seen: bool,
+    /// muted in Zellij (pane, tab or session): dimmed, never pulses, never notifies
+    muted: bool,
+    /// when the pane entered its status, for notifications: Zellij restamps `status_since` when an agent re-sends the
+    /// same state, which is no new entry. A status in between (needs you → working → needs you) is one
+    entered_ms: i64,
+    /// this bar saw the pane enter its status. A bar started since only knows the latest restamp, so its since is no
+    /// new entry into the same status (another bar's notification would repeat)
+    saw_entry: bool,
     /// (floating, y, x) on screen: numbers go top-to-bottom, left-to-right within a tab
     screen_pos: (bool, usize, usize),
+}
+
+/// An agent pane in Zellij's attention data: any pane that reported its state with OSC 7501.
+struct NativePane<'a> {
+    session: &'a str,
+    pane: u32,
+    attention: &'a PaneAttention,
+    app: Option<&'a str>,
+    title: &'a str,
 }
 
 /// Bar: the floating panel this bar opened, and the floating panes it hid to show the panel alone
@@ -138,16 +157,14 @@ struct State {
     hidden: bool,
     /// terminal panes the attached clients are focused on (authoritative; PaneInfo.is_focused goes stale)
     client_focus: Vec<u32>,
-    /// client_focus came from a live ListClients report (not handed over or kept while on the panel): only then mark questions read
-    focus_live: bool,
     /// Panel: start the selection on the focused agent once a row is focused, unless the user moved it first
     select_focused: bool,
-    /// running zellij sessions (SessionUpdate); None until the first update arrives
-    live_sessions: Option<Vec<String>>,
+    /// Zellij's attention state of every running session (GlobalAttentionUpdate); None until the first update arrives
+    attention: Option<GlobalAttention>,
+    /// (session, pane) → (status, entered_ms, saw_entry) of the native rows, from the last rebuild
+    entered: HashMap<(String, u32), (String, i64, bool)>,
     /// SGR for the focused chip, from zellij's theme (ribbon_selected = the active tab's colours)
     active_style: Option<String>,
-    /// questions marked read by this instance (session id, status_since), until the scanner reports it
-    seen_local: std::collections::HashSet<(String, i64)>,
     error: Option<String>,
 }
 
@@ -182,11 +199,10 @@ impl Default for State {
             since_poll: 0.0,
             hidden: false,
             client_focus: Vec::new(),
-            focus_live: false,
             select_focused: false,
-            live_sessions: None,
+            attention: None,
+            entered: HashMap::new(),
             active_style: None,
-            seen_local: Default::default(),
             error: None,
         }
     }
@@ -233,7 +249,7 @@ impl ZellijPlugin for State {
             EventType::Mouse,
             EventType::Key,
             EventType::ListClients,
-            EventType::SessionUpdate,
+            EventType::GlobalAttentionUpdate,
         ]);
     }
 
@@ -257,6 +273,7 @@ impl ZellijPlugin for State {
             Event::ModeUpdate(mi) => {
                 let rs = &mi.style.colors.ribbon_selected;
                 let style = Some(format!("\x1b[{};{}m", sgr(rs.base, 38), sgr(rs.background, 48)));
+                set_status_colors(&mi.style.colors);
                 let changed = self.session != mi.session_name || self.active_style != style;
                 self.active_style = style;
                 self.session = mi.session_name;
@@ -316,12 +333,10 @@ impl ZellijPlugin for State {
                         _ => None,
                     })
                     .collect();
-                // a client on the panel reports no terminal: the panel keeps the focus the bar handed over, the bar keeps its own;
-                // kept focus is for display only, so it never marks questions read
+                // a client on the panel reports no terminal: the panel keeps the focus the bar handed over, the bar keeps its own
                 let on_panel = self.panel.as_ref().is_some_and(|p| clients.iter().any(|c| c.pane_id == PaneId::Plugin(p.id)));
                 let keep = focus.is_empty() && (self.mode == Mode::Panel || on_panel);
-                let changed = !keep && (focus != self.client_focus || !self.focus_live);
-                self.focus_live = !keep;
+                let changed = !keep && focus != self.client_focus;
                 if changed {
                     self.client_focus = focus;
                     self.rebuild();
@@ -329,9 +344,10 @@ impl ZellijPlugin for State {
                 self.track_panel(); // a panel that closed while our tab was off screen restores once it is back
                 changed
             }
-            Event::SessionUpdate(sessions, _) => {
-                self.live_sessions = Some(sessions.into_iter().map(|s| s.name).collect());
-                false
+            Event::GlobalAttentionUpdate(attention) => {
+                self.attention = Some(attention);
+                self.rebuild();
+                true
             }
             Event::RunCommandResult(code, out, err, ctx) => {
                 match ctx.get("zam").map(String::as_str) {
@@ -383,7 +399,7 @@ impl ZellijPlugin for State {
                     true
                 }
                 BareKey::Char('n') => {
-                    // jump to the next agent that needs attention (needs_input first, then idle)
+                    // jump to the next agent that needs attention (needs you, failed, done, then idle)
                     if let Some(i) = self.next_attention() {
                         self.selected = i;
                         self.jump(i);
@@ -589,9 +605,9 @@ impl State {
         self.next_tick = Some(std::time::Instant::now() + std::time::Duration::from_secs_f64(step));
     }
 
-    /// Redraw the spinner only on screen, and only when something is spinning.
+    /// Redraw the spinner only on screen, and only when something is spinning or pulsing.
     fn animating(&self) -> bool {
-        !self.hidden && self.rows.iter().any(|r| r.agent.status == "busy" || r.agent.status == "needs_input")
+        !self.hidden && self.rows.iter().any(|r| r.agent.status == "working" || r.waiting())
     }
 
     /// list_clients() fires on every pane/tab event too; keep scans at most once per interval.
@@ -608,9 +624,11 @@ impl State {
         // the scanner ignores --from; it shows up in `ps` and helps debugging
         let who = format!("id={}", self.my_id);
         let mut args = vec!["--from", who.as_str()];
-        // only bars notify: the panel is transient and would ignore the bar's `notify false`
-        if self.mode == Mode::Bar && self.notify {
-            args.push("--notify");
+        // only bars notify: the panel is transient and would ignore the bar's `notify false`. The scanner notifies on
+        // Zellij's states, so they go along; it claims each change once across all bars
+        let native = (self.mode == Mode::Bar && self.notify).then(|| self.native_json());
+        if let Some(n) = &native {
+            args.extend(["--native", n.as_str()]);
         }
         self.run_scanner(&args, "scan");
     }
@@ -631,6 +649,53 @@ impl State {
         }
     }
 
+    /// Agent panes from Zellij's attention data (`is_agent`): this session's from PaneUpdate, the other sessions' from
+    /// GlobalAttentionUpdate. Both keep a pane that reported once listed while idle (`remembered`).
+    fn native_panes(&self) -> Vec<NativePane<'_>> {
+        let mut out = vec![];
+        if let Some(session) = self.session.as_deref() {
+            for p in self.panes.panes.values().flatten().filter(|p| !p.is_plugin) {
+                if is_agent(&p.attention) {
+                    let app = p.attention.detail.app.as_deref().or_else(|| p.program_status.iter().find_map(|r| r.app.as_deref()));
+                    out.push(NativePane { session, pane: p.id, attention: &p.attention, app, title: &p.title });
+                }
+            }
+        }
+        for g in self.attention.iter().flat_map(|a| &a.items) {
+            let a = &g.item.attention;
+            if let PaneId::Terminal(pane) = g.item.pane_id {
+                if Some(g.session.as_str()) != self.session.as_deref() && is_agent(a) {
+                    let app = a.detail.app.as_deref();
+                    out.push(NativePane { session: &g.session, pane, attention: a, app, title: &g.item.pane_title });
+                }
+            }
+        }
+        out
+    }
+
+    /// The bar's native agent states for the scanner's notifications (`--native`).
+    fn native_json(&self) -> String {
+        let entries: Vec<serde_json::Value> = self
+            .rows
+            .iter()
+            .filter(|r| r.native)
+            .map(|r| {
+                serde_json::json!({
+                    "session": r.agent.zellij_session,
+                    "pane": r.agent.pane_id,
+                    "status": r.agent.status,
+                    "since_ms": r.entered_ms,
+                    "saw_entry": r.saw_entry,
+                    "muted": r.muted,
+                    "app": r.agent.kind,
+                    "title": self.purpose(r),
+                    "text": r.agent.detail,
+                })
+            })
+            .collect();
+        serde_json::Value::from(entries).to_string()
+    }
+
     fn rebuild(&mut self) {
         let mut where_: HashMap<u32, (usize, String, (bool, usize, usize))> = HashMap::new();
         for (tab_pos, panes) in &self.panes.panes {
@@ -638,26 +703,71 @@ impl State {
                 where_.insert(p.id, (*tab_pos, p.title.clone(), (p.is_floating, p.pane_y, p.pane_x)));
             }
         }
-        let mut rows: Vec<Row> = self
-            .scan
-            .agents
-            .iter()
-            .map(|a| {
+        let native = self.native_panes();
+        let same = |n: &NativePane, a: &Agent| a.zellij_session.as_deref() == Some(n.session) && a.pane_id == Some(n.pane);
+        // the scanner's agents, then the native agent panes it doesn't know (OpenCode, Copilot CLI, …): no extras.
+        // An app the scanner detects is its call: a Claude that quit leaves a Done record behind in its pane
+        let unknown = native.iter().filter(|n| !self.scan.agents.iter().any(|a| same(n, a)) && !n.app.is_some_and(|app| SCANNED_APPS.iter().any(|s| s.1 == app))).map(|n| Agent {
+            kind: n.app.unwrap_or_default().to_string(),
+            name: n.app.unwrap_or("agent").to_string(),
+            zellij_session: Some(n.session.to_string()),
+            pane_id: Some(n.pane),
+            ..Default::default()
+        });
+        let agents: Vec<Agent> = self.scan.agents.iter().cloned().chain(unknown).collect();
+        let mut rows: Vec<Row> = agents
+            .into_iter()
+            .map(|mut a| {
                 let local = a.zellij_session.is_some() && a.zellij_session == self.session;
                 let loc = if local { a.pane_id.and_then(|id| where_.get(&id)) } else { None };
-                let tab_pos = loc.map(|l| l.0);
-                Row {
-                    pane_title: loc.map(|l| l.1.clone()).unwrap_or_default(),
+                // a record another agent left in the pane (a Claude, then Cursor) is not this one's. Cursor reports none
+                let owns = |n: &NativePane| match SCANNED_APPS.iter().find(|s| s.0 == a.kind) {
+                    Some(&(_, app)) => n.app.map_or(true, |x| x == app),
+                    None => a.kind != "cursor",
+                };
+                let n = native.iter().find(|n| same(n, &a) && owns(n));
+                let mut row = Row {
+                    pane_title: loc.map(|l| l.1.clone()).or_else(|| n.map(|n| n.title.to_string())).unwrap_or_default(),
                     focused: loc.is_some() && a.pane_id.map_or(false, |id| self.client_focus.contains(&id)),
-                    tab_pos,
+                    tab_pos: loc.map(|l| l.0),
                     screen_pos: loc.map(|l| l.2).unwrap_or_default(),
                     local,
-                    seen: a.seen
-                        || a.id.as_ref().is_some_and(|id| self.seen_local.contains(&(id.clone(), a.status_since))),
-                    agent: a.clone(),
+                    // mute belongs to the pane, whichever agent owns it (Cursor too, which has no native status)
+                    muted: a.pane_id.is_some_and(|id| match local {
+                        true => self.panes.panes.values().flatten().any(|p| p.id == id && !p.is_plugin && p.attention.muted.is_some()),
+                        false => self.attention.iter().flat_map(|g| &g.items).any(|g| {
+                            a.zellij_session.as_deref() == Some(g.session.as_str()) && g.item.pane_id == PaneId::Terminal(id) && g.item.attention.muted.is_some()
+                        }),
+                    }),
+                    ..Default::default()
+                };
+                if let Some(n) = n {
+                    let at = n.attention;
+                    a.status = native_status(at.status).into();
+                    // an idle pane that reported before keeps when it last reported
+                    let since = if at.since_ms > 0 { at.since_ms } else { at.remembered.as_ref().map_or(0, |r| r.since_ms) };
+                    a.status_since = since as i64;
+                    // the activity ("needs approval: Bash"), not a bare repeat of the status ("working")
+                    let label = status_style(&a.status, 0, false).1;
+                    a.detail = if at.text.eq_ignore_ascii_case(label) { String::new() } else { at.text.clone() };
+                    (row.native, row.seen) = (true, at.seen);
                 }
+                row.agent = a;
+                row
             })
             .collect();
+        // a rebuild runs on every PaneUpdate and GlobalAttentionUpdate, so it sees the statuses in between
+        let mut entered = HashMap::new();
+        for r in rows.iter_mut().filter(|r| r.native) {
+            let key = (r.agent.zellij_session.clone().unwrap_or_default(), r.agent.pane_id.unwrap_or_default());
+            (r.entered_ms, r.saw_entry) = match self.entered.get(&key) {
+                Some((status, since, saw)) if *status == r.agent.status => (*since, *saw),
+                Some(_) => (r.agent.status_since, true),
+                None => (r.agent.status_since, false),
+            };
+            entered.insert(key, (r.agent.status.clone(), r.entered_ms, r.saw_entry));
+        }
+        self.entered = entered;
         // local agents first, in tab order; then other sessions; then agents outside zellij
         rows.sort_by_key(|r| {
             (
@@ -668,16 +778,6 @@ impl State {
                 r.agent.started_at,
             )
         });
-        // focusing a waiting agent reads its question: shared through the scanner so every tab's bar agrees
-        for r in rows.iter_mut().filter(|r| self.focus_live && r.focused && r.agent.status == "needs_input" && !r.seen) {
-            r.seen = true;
-            if let Some(id) = r.agent.id.clone() {
-                let ts = r.agent.status_since.to_string();
-                self.run_scanner(&["--seen", &id, &ts], "seen");
-                self.seen_local.insert((id, r.agent.status_since));
-            }
-        }
-        self.seen_local.retain(|k| rows.iter().any(|r| r.agent.id.as_ref() == Some(&k.0) && r.agent.status_since == k.1));
         self.rows = rows;
         if self.selected >= self.rows.len() {
             self.selected = self.rows.len().saturating_sub(1);
@@ -702,10 +802,11 @@ impl State {
 
     fn next_attention(&self) -> Option<usize> {
         let n = self.rows.len();
-        for want in ["needs_input", "idle"] {
+        for want in ["needs_you", "failed", "done", "idle"] {
             for off in 1..=n {
                 let i = (self.selected + off) % n;
-                if self.rows[i].agent.status == want && !self.rows[i].focused {
+                let r = &self.rows[i];
+                if r.agent.status == want && !r.focused && !r.muted {
                     return Some(i);
                 }
             }
@@ -721,8 +822,8 @@ impl State {
             focus_terminal_pane(pane, true, false); // a hidden floating pane comes back floating
         } else if let Some(s) = &row.agent.zellij_session {
             // switching to a name that isn't running would silently create an empty session
-            if self.live_sessions.as_ref().map_or(true, |live| live.contains(s)) {
-                switch_session_with_focus(s, None, Some((pane, false)));
+            if self.attention.as_ref().map_or(true, |a| a.has_session(s)) {
+                focus_session_pane(s, PaneId::Terminal(pane));
             } else {
                 self.error = Some(format!("session {s} is not running"));
                 return;
@@ -733,18 +834,61 @@ impl State {
         }
     }
 
-    fn counts(&self) -> (usize, usize, usize, usize) {
-        let mut c = (0, 0, 0, 0); // needs, busy, idle, total
+    fn counts(&self) -> Counts {
+        let mut c = Counts::default();
         for r in &self.rows {
+            c.total += 1;
+            if r.muted {
+                continue; // as Zellij counts: a muted agent is listed, not counted
+            }
             match r.agent.status.as_str() {
-                "needs_input" => c.0 += 1,
-                "busy" | "shell" => c.1 += 1,
-                "idle" => c.2 += 1,
+                "needs_you" => c.needs += 1,
+                "failed" => c.failed += 1,
+                "done" => c.done += 1,
+                "working" => c.working += 1,
+                "idle" => c.idle += 1,
                 _ => {}
             }
-            c.3 += 1;
         }
         c
+    }
+}
+
+/// agents per status, for the bar's header block and the panel's header line
+#[derive(Default)]
+struct Counts {
+    needs: usize,
+    failed: usize,
+    done: usize,
+    working: usize,
+    idle: usize,
+    total: usize,
+}
+
+impl Row {
+    /// needs you and not muted: the chip pulses (until seen) or its icon blinks (after)
+    fn waiting(&self) -> bool {
+        self.agent.status == "needs_you" && !self.muted
+    }
+}
+
+/// (the scanner's kind, its OSC 7501 app) of the agents the scanner finds (Claude Code, Codex, agy); Cursor reports none
+const SCANNED_APPS: [(&str, &str); 3] = [("claude", "claude-code"), ("codex", "codex"), ("agy", "antigravity")];
+
+/// An agent pane in Zellij's attention data, the same test for this session and the others: it reports with an app
+/// now, or reported before and stays listed while idle. A shell with new output or a finished command is neither.
+fn is_agent(a: &PaneAttention) -> bool {
+    a.detail.app.is_some() || a.remembered.is_some()
+}
+
+/// Zellij's attention status as ours; output and quiet on an agent pane count as idle.
+fn native_status(s: AttentionStatus) -> &'static str {
+    match s {
+        AttentionStatus::NeedsYou => "needs_you",
+        AttentionStatus::Failed => "failed",
+        AttentionStatus::Done => "done",
+        AttentionStatus::Working => "working",
+        AttentionStatus::Quiet | AttentionStatus::NewOutput | AttentionStatus::Idle => "idle",
     }
 }
 
@@ -765,24 +909,74 @@ fn sgr(c: PaletteColor, layer: u8) -> String {
     }
 }
 
-/// Waiting-for-you colours: amber (not red, which reads as an error). The chip pulses between the two.
-const WAIT_FG: &str = "\x1b[1;38;5;214m";
-const WAIT_BG: &str = "\x1b[1;30;48;5;214m";
 
 /// Spinner for working agents: a quarter-filled circle turning clockwise.
 const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
 /// Seconds per spinner frame.
 const ANIM_STEP: f64 = 0.3;
 
-fn status_style(status: &str, frame: usize) -> (&'static str, &'static str, &'static str) {
-    // (icon, label, colour)
-    match status {
-        "needs_input" => ("?", "NEEDS YOU", WAIT_FG),
-        "busy" => (SPINNER[frame % SPINNER.len()], "working", "\x1b[33m"),
-        "shell" => ("●", "shell", "\x1b[34m"),
-        "idle" => ("○", "idle", "\x1b[32m"),
-        _ => ("?", "unknown", "\x1b[90m"),
+/// Status colours, as Zellij paints them from the theme. Defaults hold until the first ModeUpdate.
+#[derive(Clone, Copy, PartialEq)]
+struct StatusColors {
+    /// needs you: text colour and the pulsing chip's background (emphasis_0, orange in the default theme)
+    needs_fg: &'static str,
+    needs_bg: &'static str,
+    failed: &'static str,
+    done: &'static str,
+    working: &'static str,
+}
+
+thread_local! {
+    static STATUS_COLORS: std::cell::Cell<StatusColors> = const { std::cell::Cell::new(StatusColors {
+        needs_fg: "\x1b[1;38;5;214m",
+        needs_bg: "\x1b[1;30;48;5;214m",
+        failed: "\x1b[31m",
+        done: "\x1b[32m",
+        working: "\x1b[34m",
+    }) };
+}
+
+fn colors() -> StatusColors {
+    STATUS_COLORS.get()
+}
+
+/// Follow the theme: needs you = text_unselected.emphasis_0, failed = exit_code_error.base,
+/// done = exit_code_success.base, working = text_unselected.emphasis_1 (the slots Zellij's session panel uses).
+/// Strings are built owned and compared first; only a changed theme leaks (a few short strings per change).
+fn set_status_colors(st: &Styling) {
+    let fg = |c: PaletteColor| format!("\x1b[{}m", sgr(c, 38));
+    let needs = st.text_unselected.emphasis_0;
+    let built = [
+        format!("\x1b[1;{}m", sgr(needs, 38)),
+        format!("\x1b[1;30;{}m", sgr(needs, 48)),
+        fg(st.exit_code_error.base),
+        fg(st.exit_code_success.base),
+        fg(st.text_unselected.emphasis_1),
+    ];
+    let cur = colors();
+    if [cur.needs_fg, cur.needs_bg, cur.failed, cur.done, cur.working]
+        .iter()
+        .zip(&built)
+        .all(|(a, b)| *a == b.as_str())
+    {
+        return;
     }
+    let [needs_fg, needs_bg, failed, done, working] =
+        built.map(|s| -> &'static str { Box::leak(s.into_boxed_str()) });
+    STATUS_COLORS.set(StatusColors { needs_fg, needs_bg, failed, done, working });
+}
+
+/// (icon, label, colour) of a status: Zellij's icons. A muted agent keeps its icon, dimmed.
+fn status_style(status: &str, frame: usize, muted: bool) -> (&'static str, &'static str, &'static str) {
+    let (icon, label, color) = match status {
+        "needs_you" => ("●", "NEEDS YOU", colors().needs_fg),
+        "failed" => ("✗", "failed", colors().failed),
+        "done" => ("✓", "done", colors().done),
+        "working" => (SPINNER[frame % SPINNER.len()], "working", colors().working),
+        "idle" => ("○", "idle", SOFT),
+        _ => ("?", "unknown", "\x1b[90m"),
+    };
+    (icon, label, if muted { DIM } else { color })
 }
 
 fn ago(now: i64, ts: i64) -> String {
@@ -896,17 +1090,29 @@ impl State {
     fn render_bar(&mut self, cols: usize) -> String {
         // chips shrink (widest first) down to this; below it, trailing chips hide behind "+N"
         const CHIP_MIN: usize = 16;
-        let (needs, busy, idle, total) = self.counts();
+        let c = self.counts();
         let mut l0 = String::new();
         let mut l1 = String::new();
         let mut x = 0usize;
         // header block
-        let h0 = format!(" AGENTS {total} ");
-        let h1 = format!(" ?{needs} ●{busy} ○{idle} ");
+        let h0 = format!(" AGENTS {} ", c.total);
+        let h1 = format!(" ●{} ✗{} ✓{} ◐{} ○{} ", c.needs, c.failed, c.done, c.working, c.idle);
         let hw = dw(&h0).max(dw(&h1));
         l0.push_str(&format!("{BOLD}{}{RESET}", trunc(&h0, hw)));
-        let needs_style = if needs > 0 { WAIT_FG } else { DIM };
-        l1.push_str(&format!("{DIM} {needs_style}?{needs}{RESET}{DIM} \x1b[33m●{busy}{RESET}{DIM} \x1b[32m○{idle}{RESET}{}", " ".repeat(hw - dw(&h1) + 1)));
+        let col = colors();
+        let needs_style = if c.needs > 0 { col.needs_fg } else { DIM };
+        l1.push_str(&format!(
+            "{DIM} {needs_style}●{}{RESET}{DIM} {}✗{}{RESET}{DIM} {}✓{}{RESET}{DIM} {}◐{}{RESET}{DIM} {SOFT}○{}{RESET}{}",
+            c.needs,
+            col.failed,
+            c.failed,
+            col.done,
+            c.done,
+            col.working,
+            c.working,
+            c.idle,
+            " ".repeat(hw - dw(&h1) + 1)
+        ));
         x += hw;
         self.header_w = hw;
         if let Some(e) = &self.error {
@@ -933,14 +1139,14 @@ impl State {
             .iter()
             .zip(&self.rows)
             .map(|((num, ctx, loc, purpose), r)| {
-                let lo = dw(status_style(&r.agent.status, self.frame).0) + dw(num) + dw(ctx);
+                let lo = dw(status_style(&r.agent.status, self.frame, r.muted).0) + dw(num) + dw(ctx);
                 (lo, (lo + dw(loc)).max(dw(purpose)))
             })
             .collect();
         let cap = shared_cap(&items, cols.saturating_sub(x + 3 * self.rows.len()), CHIP_MIN).unwrap_or(CHIP_MIN);
         for (i, (num, ctx, loc, purpose)) in chips.iter().enumerate() {
             let r = &self.rows[i];
-            let (icon, _, color) = status_style(&r.agent.status, self.frame);
+            let (icon, _, color) = status_style(&r.agent.status, self.frame, r.muted);
             let loc = trunc(loc, cap.saturating_sub(items[i].0)).trim_end().to_string();
             let status = format!("{icon}{num}{loc}{ctx}");
             let w = dw(&status).max(dw(purpose).min(cap));
@@ -956,30 +1162,33 @@ impl State {
             // inactive chips: dark grey, so each chip reads as a tab
             let (pre, post) = if r.focused { (active, RESET) } else { (GREY_BG, RESET) };
             // waiting for you: the whole chip pulses amber (0.6s on, 0.6s off), driven by the spinner clock
-            let waiting = r.agent.status == "needs_input";
+            let waiting = r.waiting();
             let on = (self.frame / 2) % 2 == 0;
-            // unread question: the whole chip pulses; read (focused once): only the "?" blinks
+            // not yet seen in Zellij: the whole chip pulses; seen: only the "●" blinks
             let pulse = waiting && !r.seen && on;
             let icon_hidden = waiting && r.seen && !on;
-            let pre = if pulse { WAIT_BG } else { pre };
+            let pre = if pulse { colors().needs_bg } else { pre };
             l0.push_str(&format!("{DIM}│{RESET}{pre} "));
             l1.push_str(&format!("{DIM}│{RESET}{pre} "));
             x += 2;
             // on the coloured backgrounds (focused, pulsing) status/ctx colours turn unreadable: use the theme's
             // text colour, except the "needs you" badge and (focused only) a critical ctx, which must stand out
+            // a muted agent is dimmed throughout
             let plain = !r.focused && !pulse;
             let ctx_col = match self.ctx_pct(&r.agent).map(|p| ctx_color(p as f64)) {
+                _ if r.muted => DIM,
                 Some(c) if plain || (c == RED && !pulse) => c,
                 None if plain => SOFT,
                 _ => "",
             };
-            let (soft, branch_col) = if plain { (SOFT, CYAN) } else { ("", "") };
+            let (soft, branch_col) = if r.muted { (DIM, DIM) } else if plain { (SOFT, CYAN) } else { ("", "") };
             let (repo, branch) = split_branch(&loc);
-            let color = if pulse { "" } else if r.focused && !waiting { BOLD } else { color };
+            let color = if pulse { "" } else if r.focused && !waiting && !r.muted { BOLD } else { color };
             let pad = " ".repeat(w - dw(&status));
-            // blink "off": the "?" disappears, the number stays
+            // blink "off": the "●" disappears, the number stays
             let icon = if icon_hidden { " " } else { icon };
-            l0.push_str(&format!("{pre}{} {post}", trunc(purpose, w)));
+            let dim = if r.muted { DIM } else { "" };
+            l0.push_str(&format!("{pre}{dim}{}{RESET}{pre} {post}", trunc(purpose, w)));
             l1.push_str(&format!(
                 "{pre}{color}{icon}{RESET}{pre}{soft}{num}{repo}{RESET}{pre}{branch_col}{branch}{RESET}{pre}{ctx_col}{ctx}{RESET}{pre}{pad} {post}"
             ));
@@ -1092,18 +1301,22 @@ impl State {
         // WHERE, TAB and MODEL narrow down to this before the line is cut
         const FLEX_MIN: usize = 8;
         let mut lines = vec![];
-        let (needs, busy, idle, total) = self.counts();
+        let c = self.counts();
         let now = self.scan.now;
         lines.push(fit(
             "",
             &[
                 (BOLD, " 🤖 Agents".into()),
-                ("", format!(" {total}   ")),
-                (if needs > 0 { WAIT_FG } else { DIM }, format!("⏳ {needs} need you")),
+                ("", format!(" {}   ", c.total)),
+                (if c.needs > 0 { colors().needs_fg } else { DIM }, format!("⏳ {} need you", c.needs)),
                 ("", "   ".into()),
-                (YELLOW, format!("⚡ {busy} working")),
+                (colors().failed, format!("❌ {} failed", c.failed)),
                 ("", "   ".into()),
-                ("\x1b[32m", format!("💤 {idle} idle")),
+                (colors().done, format!("✅ {} done", c.done)),
+                ("", "   ".into()),
+                (colors().working, format!("⚡ {} working", c.working)),
+                ("", "   ".into()),
+                (SOFT, format!("💤 {} idle", c.idle)),
             ],
             cols,
         ));
@@ -1125,14 +1338,14 @@ impl State {
             .enumerate()
             .map(|(i, r)| {
                 let a = &r.agent;
-                let (icon, label, color) = status_style(&a.status, self.frame);
+                let (icon, label, color) = status_style(&a.status, self.frame, r.muted);
                 let pct = self.ctx_pct(a);
                 let ctx_col = pct.map_or("", |p| ctx_color(p as f64));
                 let ctx = self.ctx_label(a).unwrap_or_else(|| "-".into());
-                let waiting = a.status == "needs_input";
-                // unread question: the status cell pulses; read: it stays amber, only the "?" blinks
+                let waiting = r.waiting();
+                // not yet seen in Zellij: the status cell pulses; seen: it stays amber, only the "●" blinks
                 let color = if waiting && !r.seen && on {
-                    WAIT_BG
+                    colors().needs_bg
                 } else {
                     color
                 };
@@ -1238,6 +1451,7 @@ impl State {
 
 const YELLOW: &str = "\x1b[33m";
 const RED: &str = "\x1b[31m";
+const GREEN: &str = "\x1b[32m";
 // @branch (bar and panel WHERE), COST and credits money, panel TAB and MODEL: match the Claude status line
 const CYAN: &str = "\x1b[36m";
 const MAGENTA: &str = "\x1b[35m";
@@ -1268,7 +1482,7 @@ fn ctx_color(p: f64) -> &'static str {
     } else if p > 50.0 {
         "\x1b[38;5;208m"
     } else {
-        "\x1b[32m"
+        GREEN
     }
 }
 
@@ -1336,15 +1550,15 @@ mod tests {
     fn bar_rows() {
         let mut s = State::default();
         let agent = Agent { status: "idle".into(), cwd: Some("/x/svc".into()), branch: Some("main".into()), ctx_pct: Some(78.0), title: "fix login".into(), ..Default::default() };
-        s.rows = vec![Row { agent, tab_pos: None, pane_title: String::new(), local: true, focused: false, seen: false, screen_pos: (false, 0, 0) }];
+        s.rows = vec![Row { agent, local: true, ..Default::default() }];
         let out = s.render_bar(120);
         let lines: Vec<String> = out.split('\n').map(strip).collect();
         assert!(lines[0].contains("fix login") && lines[1].contains("svc@main 78%"), "{lines:?}");
         assert_eq!(dw(&lines[0]), dw(&lines[1]), "{lines:?}");
 
-        // focused + seen needs_input chips, with the "?" shown and hidden: rows stay equal width, hits match the chips
+        // focused + seen needs_you chips, with the "●" shown and hidden: rows stay equal width, hits match the chips
         let agent = |status: &str, title: &str| Agent { status: status.into(), cwd: Some("/x/svc".into()), branch: Some("main".into()), ctx_pct: Some(90.0), title: title.into(), ..Default::default() };
-        let row = |agent, focused, seen| Row { agent, tab_pos: None, pane_title: String::new(), local: true, focused, seen, screen_pos: (false, 0, 0) };
+        let row = |agent, focused, seen| Row { agent, local: true, focused, seen, ..Default::default() };
         // the display cells [a, b) of a line
         let cells = |l: &str, a: usize, b: usize| {
             let (mut x, mut out) = (0, String::new());
@@ -1357,7 +1571,7 @@ mod tests {
             }
             out
         };
-        s.rows = vec![row(agent("idle", "first"), true, false), row(agent("needs_input", "second"), false, true), row(agent("busy", "third"), false, false)];
+        s.rows = vec![row(agent("idle", "first"), true, false), row(agent("needs_you", "second"), false, true), row(agent("working", "third"), false, false)];
         for frame in [0, 2] {
             s.frame = frame;
             s.hits.clear();
@@ -1370,9 +1584,9 @@ mod tests {
                 assert!(cells(&lines[0], h0.1, h0.2).trim_end() == *title, "frame {frame} chip {n}: {lines:?}");
                 assert!(cells(&lines[1], h1.1, h1.2).contains(&format!(" {} svc@main", n + 1)), "frame {frame} chip {n}: {lines:?}");
             }
-            // the "?" is in the second chip's range only while shown (the header's "?0" is outside every chip)
+            // the "●" is in the second chip's range only while shown (the header's "●1" is outside every chip)
             let h = s.hits.iter().find(|h| h.0 == 1 && h.3 == 1).unwrap();
-            assert_eq!(cells(&lines[1], h.1, h.2).contains('?'), frame == 0, "frame {frame}: {lines:?}");
+            assert_eq!(cells(&lines[1], h.1, h.2).contains('●'), frame == 0, "frame {frame}: {lines:?}");
         }
 
         // too narrow for every chip: "+N" appears and no row is wider than the bar
@@ -1398,6 +1612,186 @@ mod tests {
         assert!(lines[0].contains("refactor the scanner") && lines[0].contains('…') && lines[1].contains("eng-intelligence@"), "{lines:?}");
         assert!(lines[0].contains(" fix ") && lines[1].contains(" 2 svc@main 90%") && !lines[1].contains(" +"), "{lines:?}");
         assert!(dw(&lines[0]) == dw(&lines[1]) && dw(&lines[0]) <= cols, "{lines:?}");
+    }
+
+    /// Zellij's attention data of an agent pane
+    fn attention(status: AttentionStatus, text: &str, app: Option<&str>) -> PaneAttention {
+        let mut a = PaneAttention { status, text: text.into(), since_ms: 5000, ..Default::default() };
+        a.detail.app = app.map(String::from);
+        a
+    }
+
+    /// a session "here" (panes 3, 4, 5, 6, 10) and another, "away" (panes 7, 8, 9), with scanner agents in some
+    fn native_state() -> State {
+        let mut s = State { session: Some("here".into()), ..Default::default() };
+        let pane = |id, attention| PaneInfo { id, attention, ..Default::default() };
+        let mut claude = pane(3, attention(AttentionStatus::Working, "working", Some("claude-code")));
+        claude.program_status = serde_json::from_str(r#"[{"app": "claude-code", "state": "Working", "updated_ms": 5000}]"#).unwrap();
+        // an agent that reported once and went quiet: no app on the attention, but it is remembered
+        let mut quiet = pane(6, attention(AttentionStatus::Quiet, "went quiet", None));
+        quiet.attention.remembered = Some(RememberedStatus { status: AttentionStatus::Idle, text: "idle".into(), since_ms: 4000 });
+        quiet.program_status = serde_json::from_str(r#"[{"state": "Idle", "updated_ms": 4000}]"#).unwrap();
+        // idle and seen since: Zellij forgot it reported, only the record is left. The other sessions don't list it either
+        let mut seen = pane(11, attention(AttentionStatus::Idle, "", None));
+        seen.program_status = serde_json::from_str(r#"[{"app": "test", "state": "Idle", "updated_ms": 4000}]"#).unwrap();
+        let panes = vec![
+            claude,
+            pane(4, attention(AttentionStatus::NeedsYou, "needs approval: Bash", Some("opencode"))),
+            pane(5, attention(AttentionStatus::NewOutput, "new output", None)), // a plain shell
+            quiet,
+            pane(10, PaneAttention::default()), // Cursor: reports nothing
+            seen,
+            // a Claude that finished and then quit: its Done record stays, the scanner no longer lists it
+            pane(12, attention(AttentionStatus::Done, "done", Some("claude-code"))),
+        ];
+        s.panes.panes.insert(0, panes);
+        let item = |session: &str, pane, attention| GlobalAttentionItem {
+            session: session.into(),
+            is_current: session == "here",
+            item: AttentionItem { pane_id: PaneId::Terminal(pane), tab_id: 0, tab_name: "t".into(), pane_title: format!("title {pane}"), attention },
+        };
+        let mut idle = attention(AttentionStatus::Idle, "", None);
+        (idle.since_ms, idle.remembered) = (0, Some(RememberedStatus { status: AttentionStatus::Done, text: "done".into(), since_ms: 3000 }));
+        let mut muted = attention(AttentionStatus::Done, "done: tests pass", Some("copilot"));
+        muted.muted = Some(MuteScope::Tab);
+        s.attention = Some(GlobalAttention {
+            items: vec![
+                item("here", 4, attention(AttentionStatus::NeedsYou, "needs approval: Bash", Some("opencode"))),
+                item("away", 7, idle),
+                item("away", 8, muted),
+                item("away", 9, attention(AttentionStatus::Done, "done · 3s", None)), // a finished shell command
+                item("away", 13, attention(AttentionStatus::Done, "done", Some("codex"))), // a Codex that quit
+            ],
+            ..Default::default()
+        });
+        let agent = |kind: &str, session: &str, pane, status: &str| Agent {
+            kind: kind.into(),
+            zellij_session: Some(session.into()),
+            pane_id: Some(pane),
+            status: status.into(),
+            branch: Some(format!("{kind}-branch")),
+            ..Default::default()
+        };
+        s.scan.agents = vec![agent("claude", "here", 3, "idle"), agent("cursor", "here", 10, "working"), agent("codex", "away", 7, "idle")];
+        s.rebuild();
+        s
+    }
+
+    /// rows: the scanner's agents joined with Zellij's states by (session, pane), plus native agents it doesn't know
+    #[test]
+    fn native_rows() {
+        let s = native_state();
+        let rows: Vec<(&str, u32, &str, &str, bool)> = s
+            .rows
+            .iter()
+            .map(|r| (r.agent.zellij_session.as_deref().unwrap(), r.agent.pane_id.unwrap(), r.agent.kind.as_str(), r.agent.status.as_str(), r.native))
+            .collect();
+        let mut sorted = rows.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            [
+                ("away", 7, "codex", "idle", true),
+                ("away", 8, "copilot", "done", true),
+                ("here", 3, "claude", "working", true),
+                ("here", 4, "opencode", "needs_you", true),
+                ("here", 6, "", "idle", true),
+                ("here", 10, "cursor", "working", false),
+            ]
+        );
+        let row = |session: &str, pane| s.rows.iter().find(|r| r.agent.zellij_session.as_deref() == Some(session) && r.agent.pane_id == Some(pane)).unwrap();
+        // the scanner's extras stay; "working" repeats the status, the activity text does not
+        assert_eq!((row("here", 3).agent.branch.as_deref(), row("here", 3).agent.detail.as_str()), (Some("claude-branch"), ""));
+        assert_eq!(row("here", 4).agent.detail, "needs approval: Bash");
+        assert_eq!((row("here", 4).agent.name.as_str(), row("here", 4).agent.status_since), ("opencode", 5000));
+        // idle in another session: since its last report, with the pane title from Zellij
+        let away = row("away", 7);
+        assert_eq!((away.agent.status_since, away.pane_title.as_str(), away.local), (3000, "title 7", false));
+        assert!(row("away", 8).muted && !row("here", 3).muted);
+        // the bar passes only Zellij's states to the scanner, not Cursor's guess
+        let native: Vec<serde_json::Value> = serde_json::from_str(&s.native_json()).unwrap();
+        assert_eq!(native.len(), 5);
+        let e = native.iter().find(|e| e["pane"] == 4).unwrap();
+        assert_eq!(
+            (&e["session"], &e["status"], &e["since_ms"], &e["muted"], &e["app"], &e["text"]),
+            (&"here".into(), &"needs_you".into(), &5000.into(), &false.into(), &"opencode".into(), &"needs approval: Bash".into())
+        );
+        assert!(native.iter().find(|e| e["pane"] == 8).unwrap()["muted"] == true);
+        // `n`: needs you first, then done; a muted agent is skipped
+        assert_eq!(s.rows[s.next_attention().unwrap()].agent.pane_id, Some(4));
+        let c = s.counts();
+        // the muted Copilot is listed but not counted, as Zellij counts
+        assert_eq!((c.needs, c.failed, c.done, c.working, c.idle, c.total), (1, 0, 0, 2, 2, 6));
+    }
+
+    /// the bar's `--native` since is when the pane entered its status: a re-sent identical state is no new entry
+    #[test]
+    fn native_entry_time() {
+        let mut s = native_state();
+        let set = |s: &mut State, status, since| {
+            let p = s.panes.panes.get_mut(&0).unwrap().iter_mut().find(|p| p.id == 4).unwrap();
+            (p.attention.status, p.attention.since_ms) = (status, since);
+            s.rebuild();
+            let native: Vec<serde_json::Value> = serde_json::from_str(&s.native_json()).unwrap();
+            let e = native.into_iter().find(|e| e["pane"] == 4).unwrap();
+            (e["status"].as_str().unwrap().to_string(), e["since_ms"].as_i64().unwrap(), e["saw_entry"].as_bool().unwrap())
+        };
+        // the agent sends the same prompt again: Zellij restamps it, the entry stays. This bar started with the prompt
+        // up, so it did not see it entered
+        assert_eq!(set(&mut s, AttentionStatus::NeedsYou, 6000), ("needs_you".into(), 5000, false));
+        assert_eq!(s.rows.iter().find(|r| r.agent.pane_id == Some(4)).unwrap().agent.status_since, 6000);
+        // approved, then a second prompt: a new entry, seen by this bar
+        assert_eq!(set(&mut s, AttentionStatus::Working, 7000), ("working".into(), 7000, true));
+        assert_eq!(set(&mut s, AttentionStatus::NeedsYou, 8000), ("needs_you".into(), 8000, true));
+        assert_eq!(set(&mut s, AttentionStatus::NeedsYou, 9000), ("needs_you".into(), 8000, true));
+    }
+
+    /// a record another agent left in the pane is not the scanned agent's: Cursor keeps its guess, Claude its own
+    #[test]
+    fn native_record_of_another_agent() {
+        let mut s = State { session: Some("here".into()), ..Default::default() };
+        let pane = |id, app| PaneInfo { id, attention: attention(AttentionStatus::Done, "done", Some(app)), ..Default::default() };
+        s.panes.panes.insert(0, vec![pane(3, "claude-code"), pane(4, "codex")]);
+        let agent = |kind: &str, pane| Agent { kind: kind.into(), zellij_session: Some("here".into()), pane_id: Some(pane), status: "working".into(), ..Default::default() };
+        s.scan.agents = vec![agent("cursor", 3), agent("claude", 4)];
+        s.rebuild();
+        let rows: Vec<(&str, &str, bool)> = s.rows.iter().map(|r| (r.agent.kind.as_str(), r.agent.status.as_str(), r.native)).collect();
+        assert_eq!(rows, [("cursor", "working", false), ("claude", "working", false)]);
+        assert_eq!(s.native_json(), "[]");
+    }
+
+    /// a muted Cursor pane is dimmed and not counted, yet keeps the scanner's status and stays out of the native states
+    #[test]
+    fn muted_cursor() {
+        let mut s = native_state();
+        s.panes.panes.get_mut(&0).unwrap().iter_mut().find(|p| p.id == 10).unwrap().attention.muted = Some(MuteScope::Pane);
+        s.rebuild();
+        let r = s.rows.iter().find(|r| r.agent.pane_id == Some(10)).unwrap();
+        assert!(r.muted && !r.native && r.agent.status == "working");
+        let native: Vec<serde_json::Value> = serde_json::from_str(&s.native_json()).unwrap();
+        assert!(native.iter().all(|e| e["pane"] != 10));
+    }
+
+    /// a muted agent waiting on you keeps its icon, dimmed, and its chip never pulses
+    #[test]
+    fn muted_chip() {
+        let mut s = State::default();
+        let agent = Agent { status: "needs_you".into(), title: "deploy".into(), ..Default::default() };
+        s.rows = vec![Row { agent: agent.clone(), local: true, native: true, muted: true, ..Default::default() }];
+        for frame in 0..4 {
+            s.frame = frame;
+            let out = s.render_bar(120);
+            let l1 = out.split('\n').nth(1).unwrap();
+            assert!(!out.contains(colors().needs_bg) && l1.contains(&format!("{DIM}●")), "frame {frame}: {out:?}");
+            assert!(out.split('\n').next().unwrap().contains(&format!("{DIM}deploy")), "{out:?}");
+        }
+        assert!(!s.animating());
+        // the header leaves it out: no amber "●1"
+        assert!(strip(s.render_bar(120).split('\n').nth(1).unwrap()).starts_with(" ●0 ✗0"), "{:?}", s.render_bar(120));
+        // unmuted and not yet seen: it pulses
+        s.rows[0].muted = false;
+        s.frame = 0;
+        assert!(s.render_bar(120).contains(colors().needs_bg) && s.animating());
     }
 
     #[test]
@@ -1461,8 +1855,8 @@ mod tests {
             cost_usd: Some(1.2),
             ..Default::default()
         };
-        let row = |agent| Row { agent, tab_pos: None, pane_title: String::new(), local: true, focused: false, seen: false, screen_pos: (false, 0, 0) };
-        s.rows = vec![row(agent("needs_input", Some(78.0), "main")), row(agent("busy", None, "feat/5")), row(agent("idle", Some(5.0), "x"))];
+        let row = |agent| Row { agent, local: true, ..Default::default() };
+        s.rows = vec![row(agent("needs_you", Some(78.0), "main")), row(agent("working", None, "feat/5")), row(agent("idle", Some(5.0), "x"))];
         for cols in [120, 40, 8] {
             let out = s.render_panel(20, cols);
             let lines: Vec<&str> = out.split('\n').collect();
@@ -1575,7 +1969,7 @@ mod tests {
             }
         }
         // a 40x20 viewport: a 10-row pane, 8 rows inside; usage keeps its first line and drops what leaves no agent row
-        s.rows = vec![Row { agent: Agent { status: "idle".into(), ..Default::default() }, tab_pos: None, pane_title: String::new(), local: true, focused: false, seen: false, screen_pos: (false, 0, 0) }];
+        s.rows = vec![Row { agent: Agent { status: "idle".into(), ..Default::default() }, local: true, ..Default::default() }];
         for rows in [8, 6, 5] {
             s.hits.clear();
             let lines: Vec<String> = s.render_panel(rows, 40).split('\n').map(strip).collect();

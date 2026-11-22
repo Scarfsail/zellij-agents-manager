@@ -1,12 +1,12 @@
 # shellcheck shell=bash
-# Shared by the install-*.sh scripts (sourced). edit() reads the caller's $hook, $events, $had, $defs, $uninstall
-# and, if set, $sl and $sladd: they become jq's $hook, $events, $had, $sl, $sladd and $q (a single quote), and $defs
-# precedes the filter.
+# Shared by the install-*.sh scripts (sourced). edit() reads the caller's $events, $had, $defs, $uninstall and, if
+# set, $sl and $sladd: they become jq's $events, $had, $sl, $sladd and $q (a single quote), and $defs precedes the
+# filter.
 
 edit() { # file, jq filter: replace the file atomically (keeping its mode); on first install, back up the original
   local f=$1 tmp
   tmp=$(mktemp "$(dirname "$f")/.$(basename "$f").XXXXXX")
-  jq --arg hook "${hook:-}" --arg sl "${sl:-}" --arg q "'" --argjson events "${events:-[]}" --argjson had "${had:-[]}" \
+  jq --arg sl "${sl:-}" --arg q "'" --argjson events "${events:-[]}" --argjson had "${had:-[]}" \
     --argjson sladd "${sladd:-"{}"}" "${defs:-} $2" "$f" > "$tmp"
   if ! cmp -s "$tmp" "$f"; then
     [[ $uninstall || -e "$f.zam.bak" ]] || cp "$f" "$f.zam.bak"
