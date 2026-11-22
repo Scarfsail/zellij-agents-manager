@@ -273,6 +273,7 @@ impl ZellijPlugin for State {
             Event::ModeUpdate(mi) => {
                 let rs = &mi.style.colors.ribbon_selected;
                 let style = Some(format!("\x1b[{};{}m", sgr(rs.base, 38), sgr(rs.background, 48)));
+                set_status_colors(&mi.style.colors);
                 let changed = self.session != mi.session_name || self.active_style != style;
                 self.active_style = style;
                 self.session = mi.session_name;
@@ -901,22 +902,63 @@ fn sgr(c: PaletteColor, layer: u8) -> String {
     }
 }
 
-/// Waiting-for-you colours: amber (not red, which reads as an error). The chip pulses between the two.
-const WAIT_FG: &str = "\x1b[1;38;5;214m";
-const WAIT_BG: &str = "\x1b[1;30;48;5;214m";
 
 /// Spinner for working agents: a quarter-filled circle turning clockwise.
 const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
 /// Seconds per spinner frame.
 const ANIM_STEP: f64 = 0.3;
 
+/// Status colours, as Zellij paints them from the theme. Defaults hold until the first ModeUpdate.
+#[derive(Clone, Copy, PartialEq)]
+struct StatusColors {
+    /// needs you: text colour and the pulsing chip's background (emphasis_0, orange in the default theme)
+    needs_fg: &'static str,
+    needs_bg: &'static str,
+    failed: &'static str,
+    done: &'static str,
+    working: &'static str,
+}
+
+thread_local! {
+    static STATUS_COLORS: std::cell::Cell<StatusColors> = const { std::cell::Cell::new(StatusColors {
+        needs_fg: "\x1b[1;38;5;214m",
+        needs_bg: "\x1b[1;30;48;5;214m",
+        failed: "\x1b[31m",
+        done: "\x1b[32m",
+        working: "\x1b[34m",
+    }) };
+}
+
+fn colors() -> StatusColors {
+    STATUS_COLORS.get()
+}
+
+/// Follow the theme: needs you = text_unselected.emphasis_0, failed = exit_code_error.base,
+/// done = exit_code_success.base, working = text_unselected.emphasis_1 (the slots Zellij's session panel uses).
+/// Leaks a few short strings per theme change.
+fn set_status_colors(st: &Styling) {
+    let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+    let fg = |c: PaletteColor| leak(format!("\x1b[{}m", sgr(c, 38)));
+    let needs = st.text_unselected.emphasis_0;
+    let new = StatusColors {
+        needs_fg: leak(format!("\x1b[1;{}m", sgr(needs, 38))),
+        needs_bg: leak(format!("\x1b[1;30;{}m", sgr(needs, 48))),
+        failed: fg(st.exit_code_error.base),
+        done: fg(st.exit_code_success.base),
+        working: fg(st.text_unselected.emphasis_1),
+    };
+    if new != colors() {
+        STATUS_COLORS.set(new);
+    }
+}
+
 /// (icon, label, colour) of a status: Zellij's icons. A muted agent keeps its icon, dimmed.
 fn status_style(status: &str, frame: usize, muted: bool) -> (&'static str, &'static str, &'static str) {
     let (icon, label, color) = match status {
-        "needs_you" => ("●", "NEEDS YOU", WAIT_FG),
-        "failed" => ("✗", "failed", RED),
-        "done" => ("✓", "done", GREEN),
-        "working" => (SPINNER[frame % SPINNER.len()], "working", YELLOW),
+        "needs_you" => ("●", "NEEDS YOU", colors().needs_fg),
+        "failed" => ("✗", "failed", colors().failed),
+        "done" => ("✓", "done", colors().done),
+        "working" => (SPINNER[frame % SPINNER.len()], "working", colors().working),
         "idle" => ("○", "idle", SOFT),
         _ => ("?", "unknown", "\x1b[90m"),
     };
@@ -1043,12 +1085,16 @@ impl State {
         let h1 = format!(" ●{} ✗{} ✓{} ◐{} ○{} ", c.needs, c.failed, c.done, c.working, c.idle);
         let hw = dw(&h0).max(dw(&h1));
         l0.push_str(&format!("{BOLD}{}{RESET}", trunc(&h0, hw)));
-        let needs_style = if c.needs > 0 { WAIT_FG } else { DIM };
+        let col = colors();
+        let needs_style = if c.needs > 0 { col.needs_fg } else { DIM };
         l1.push_str(&format!(
-            "{DIM} {needs_style}●{}{RESET}{DIM} {RED}✗{}{RESET}{DIM} {GREEN}✓{}{RESET}{DIM} {YELLOW}◐{}{RESET}{DIM} {SOFT}○{}{RESET}{}",
+            "{DIM} {needs_style}●{}{RESET}{DIM} {}✗{}{RESET}{DIM} {}✓{}{RESET}{DIM} {}◐{}{RESET}{DIM} {SOFT}○{}{RESET}{}",
             c.needs,
+            col.failed,
             c.failed,
+            col.done,
             c.done,
+            col.working,
             c.working,
             c.idle,
             " ".repeat(hw - dw(&h1) + 1)
@@ -1107,7 +1153,7 @@ impl State {
             // not yet seen in Zellij: the whole chip pulses; seen: only the "●" blinks
             let pulse = waiting && !r.seen && on;
             let icon_hidden = waiting && r.seen && !on;
-            let pre = if pulse { WAIT_BG } else { pre };
+            let pre = if pulse { colors().needs_bg } else { pre };
             l0.push_str(&format!("{DIM}│{RESET}{pre} "));
             l1.push_str(&format!("{DIM}│{RESET}{pre} "));
             x += 2;
@@ -1248,13 +1294,13 @@ impl State {
             &[
                 (BOLD, " 🤖 Agents".into()),
                 ("", format!(" {}   ", c.total)),
-                (if c.needs > 0 { WAIT_FG } else { DIM }, format!("⏳ {} need you", c.needs)),
+                (if c.needs > 0 { colors().needs_fg } else { DIM }, format!("⏳ {} need you", c.needs)),
                 ("", "   ".into()),
-                (RED, format!("❌ {} failed", c.failed)),
+                (colors().failed, format!("❌ {} failed", c.failed)),
                 ("", "   ".into()),
-                (GREEN, format!("✅ {} done", c.done)),
+                (colors().done, format!("✅ {} done", c.done)),
                 ("", "   ".into()),
-                (YELLOW, format!("⚡ {} working", c.working)),
+                (colors().working, format!("⚡ {} working", c.working)),
                 ("", "   ".into()),
                 (SOFT, format!("💤 {} idle", c.idle)),
             ],
@@ -1285,7 +1331,7 @@ impl State {
                 let waiting = r.waiting();
                 // not yet seen in Zellij: the status cell pulses; seen: it stays amber, only the "●" blinks
                 let color = if waiting && !r.seen && on {
-                    WAIT_BG
+                    colors().needs_bg
                 } else {
                     color
                 };
@@ -1710,7 +1756,7 @@ mod tests {
             s.frame = frame;
             let out = s.render_bar(120);
             let l1 = out.split('\n').nth(1).unwrap();
-            assert!(!out.contains(WAIT_BG) && l1.contains(&format!("{DIM}●")), "frame {frame}: {out:?}");
+            assert!(!out.contains(colors().needs_bg) && l1.contains(&format!("{DIM}●")), "frame {frame}: {out:?}");
             assert!(out.split('\n').next().unwrap().contains(&format!("{DIM}deploy")), "{out:?}");
         }
         assert!(!s.animating());
@@ -1719,7 +1765,7 @@ mod tests {
         // unmuted and not yet seen: it pulses
         s.rows[0].muted = false;
         s.frame = 0;
-        assert!(s.render_bar(120).contains(WAIT_BG) && s.animating());
+        assert!(s.render_bar(120).contains(colors().needs_bg) && s.animating());
     }
 
     #[test]

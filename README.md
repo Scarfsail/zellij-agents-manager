@@ -77,7 +77,7 @@ One WASM binary (`dist/zellij-agents.wasm`, committed) runs in two modes: `bar` 
 
 A 2-row strip under the native tab bar. The block on the left (` AGENTS N `) counts the agents by status and toggles the panel. Each chip shows the session title on the first row and, in softer grey below it, the status icon, agent number, repo@branch (the `@branch` in cyan) and context % (green up to 50%, orange above and red above 80%). The status icon keeps its status colour.
 
-- The status icons are Zellij's: `●` needs you, `✗` failed, `✓` done, `◐` working (spinning) and `○` idle. Zellij's "new output" and "went quiet" on an agent pane count as idle. The header block counts each.
+- The status icons are Zellij's: `●` needs you, `✗` failed, `✓` done, `◐` working (spinning) and `○` idle. Zellij's "new output" and "went quiet" on an agent pane count as idle. The header block counts each. Their colors come from your Zellij theme, the same ones Zellij uses.
 - A chip that needs you pulses amber until Zellij marks the pane seen (you look at it); after that only the `●` blinks, until it asks something new.
 - A muted agent (`Ctrl p u`, or a muted tab or session) keeps its status icon, but its chip is dimmed and never pulses or blinks.
 - The focused agent's chip uses Zellij's active-tab colours (reverse video only as a fallback) with a bold icon, and drops the grey, cyan and ctx colours except a red ctx. A pulsing chip drops all of them, ctx included, since red on amber is unreadable.
