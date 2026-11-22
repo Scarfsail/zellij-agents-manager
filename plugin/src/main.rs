@@ -942,21 +942,28 @@ fn colors() -> StatusColors {
 
 /// Follow the theme: needs you = text_unselected.emphasis_0, failed = exit_code_error.base,
 /// done = exit_code_success.base, working = text_unselected.emphasis_1 (the slots Zellij's session panel uses).
-/// Leaks a few short strings per theme change.
+/// Strings are built owned and compared first; only a changed theme leaks (a few short strings per change).
 fn set_status_colors(st: &Styling) {
-    let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
-    let fg = |c: PaletteColor| leak(format!("\x1b[{}m", sgr(c, 38)));
+    let fg = |c: PaletteColor| format!("\x1b[{}m", sgr(c, 38));
     let needs = st.text_unselected.emphasis_0;
-    let new = StatusColors {
-        needs_fg: leak(format!("\x1b[1;{}m", sgr(needs, 38))),
-        needs_bg: leak(format!("\x1b[1;30;{}m", sgr(needs, 48))),
-        failed: fg(st.exit_code_error.base),
-        done: fg(st.exit_code_success.base),
-        working: fg(st.text_unselected.emphasis_1),
-    };
-    if new != colors() {
-        STATUS_COLORS.set(new);
+    let built = [
+        format!("\x1b[1;{}m", sgr(needs, 38)),
+        format!("\x1b[1;30;{}m", sgr(needs, 48)),
+        fg(st.exit_code_error.base),
+        fg(st.exit_code_success.base),
+        fg(st.text_unselected.emphasis_1),
+    ];
+    let cur = colors();
+    if [cur.needs_fg, cur.needs_bg, cur.failed, cur.done, cur.working]
+        .iter()
+        .zip(&built)
+        .all(|(a, b)| *a == b.as_str())
+    {
+        return;
     }
+    let [needs_fg, needs_bg, failed, done, working] =
+        built.map(|s| -> &'static str { Box::leak(s.into_boxed_str()) });
+    STATUS_COLORS.set(StatusColors { needs_fg, needs_bg, failed, done, working });
 }
 
 /// (icon, label, colour) of a status: Zellij's icons. A muted agent keeps its icon, dimmed.
