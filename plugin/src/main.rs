@@ -732,6 +732,13 @@ impl State {
                     tab_pos: loc.map(|l| l.0),
                     screen_pos: loc.map(|l| l.2).unwrap_or_default(),
                     local,
+                    // mute belongs to the pane, whichever agent owns it (Cursor too, which has no native status)
+                    muted: a.pane_id.is_some_and(|id| match local {
+                        true => self.panes.panes.values().flatten().any(|p| p.id == id && !p.is_plugin && p.attention.muted.is_some()),
+                        false => self.attention.iter().flat_map(|g| &g.items).any(|g| {
+                            a.zellij_session.as_deref() == Some(g.session.as_str()) && g.item.pane_id == PaneId::Terminal(id) && g.item.attention.muted.is_some()
+                        }),
+                    }),
                     ..Default::default()
                 };
                 if let Some(n) = n {
@@ -743,7 +750,7 @@ impl State {
                     // the activity ("needs approval: Bash"), not a bare repeat of the status ("working")
                     let label = status_style(&a.status, 0, false).1;
                     a.detail = if at.text.eq_ignore_ascii_case(label) { String::new() } else { at.text.clone() };
-                    (row.native, row.seen, row.muted) = (true, at.seen, at.muted.is_some());
+                    (row.native, row.seen) = (true, at.seen);
                 }
                 row.agent = a;
                 row
@@ -1744,6 +1751,18 @@ mod tests {
         let rows: Vec<(&str, &str, bool)> = s.rows.iter().map(|r| (r.agent.kind.as_str(), r.agent.status.as_str(), r.native)).collect();
         assert_eq!(rows, [("cursor", "working", false), ("claude", "working", false)]);
         assert_eq!(s.native_json(), "[]");
+    }
+
+    /// a muted Cursor pane is dimmed and not counted, yet keeps the scanner's status and stays out of the native states
+    #[test]
+    fn muted_cursor() {
+        let mut s = native_state();
+        s.panes.panes.get_mut(&0).unwrap().iter_mut().find(|p| p.id == 10).unwrap().attention.muted = Some(MuteScope::Pane);
+        s.rebuild();
+        let r = s.rows.iter().find(|r| r.agent.pane_id == Some(10)).unwrap();
+        assert!(r.muted && !r.native && r.agent.status == "working");
+        let native: Vec<serde_json::Value> = serde_json::from_str(&s.native_json()).unwrap();
+        assert!(native.iter().all(|e| e["pane"] != 10));
     }
 
     /// a muted agent waiting on you keeps its icon, dimmed, and its chip never pulses
