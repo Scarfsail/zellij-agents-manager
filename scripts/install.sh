@@ -17,8 +17,6 @@ here="$(cd "$(dirname "$0")/.." && pwd)"
 cfg_dir="${ZELLIJ_CONFIG_DIR:-$HOME/.config/zellij}"
 cfg="$cfg_dir/config.kdl"
 layouts="$cfg_dir/layouts"
-mkdir -p "$cfg_dir"   # a fresh zellij install may have none yet, and readlink -f needs it
-cfg_real="$(readlink -f "$cfg")"   # config.kdl may be a symlink into a dotfiles repo; edit the target
 
 mode= mod="Ctrl Alt" opts=()
 while (($#)); do
@@ -36,11 +34,20 @@ restore_dl='s|^// zellij-agents replaced: ||'
 
 if [[ $mode == --uninstall ]]; then
   rm -f "$layouts/agents.kdl" "$layouts/agents.swap.kdl"
-  sed -i -e '/\/\/ zellij-agents$/d' -e "$restore_dl" "$cfg_real"
-  echo "uninstalled (new sessions use zellij's default layout again)"
+  if [[ -f "$cfg" ]]; then
+    if grep -qE '// zellij-agents$|^// zellij-agents replaced: ' "$cfg"; then
+      cfg_real="$(readlink -f "$cfg")"
+      sed -i -e '/\/\/ zellij-agents$/d' -e "$restore_dl" "$cfg_real"
+    elif [[ $? != 1 ]]; then
+      exit 1
+    fi
+  fi
+  echo "Zellij layouts and jump keys removed"
   exit 0
 fi
 
+mkdir -p "$cfg_dir"   # a fresh zellij install may have none yet, and readlink -f needs it
+cfg_real="$(readlink -f "$cfg")"   # config.kdl may be a symlink into a dotfiles repo; edit the target
 [[ -f "$here/dist/zellij-agents.wasm" ]] || "$here/plugin/build.sh"
 mkdir -p "$layouts"
 # fresh zellij installs run on built-in defaults without a config file; our keybinds block merges with those

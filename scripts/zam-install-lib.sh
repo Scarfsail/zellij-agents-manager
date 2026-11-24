@@ -6,14 +6,17 @@
 edit() { # file, jq filter: replace the file atomically (keeping its mode); on first install, back up the original
   local f=$1 tmp
   tmp=$(mktemp "$(dirname "$f")/.$(basename "$f").XXXXXX")
-  jq --arg hook "${hook:-}" --arg sl "${sl:-}" --arg q "'" --argjson events "${events:-[]}" --argjson had "${had:-[]}" \
-    --argjson sladd "${sladd:-"{}"}" "${defs:-} $2" "$f" > "$tmp"
-  if ! cmp -s "$tmp" "$f"; then
+  if ! jq --arg hook "${hook:-}" --arg sl "${sl:-}" --arg q "'" --argjson events "${events:-[]}" --argjson had "${had:-[]}" \
+    --argjson sladd "${sladd:-"{}"}" "${defs:-} $2" "$f" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if cmp -s "$tmp" "$f" || { [[ $uninstall ]] && jq -es 'length == 2 and .[0] == .[1]' "$f" "$tmp" >/dev/null; }; then
+    rm "$tmp"
+  else
     [[ $uninstall || -e "$f.zam.bak" ]] || cp "$f" "$f.zam.bak"
     chmod --reference="$f" "$tmp"
     mv -f "$tmp" "$f"
-  else
-    rm "$tmp"
   fi
 }
 

@@ -5,6 +5,7 @@ import contextlib
 import importlib.util
 import json
 import os
+from pathlib import Path
 import pty
 import select
 import shutil
@@ -65,7 +66,8 @@ class SetupTest(unittest.TestCase):
         self.codex = os.path.join(self.home, "codex")
         os.makedirs(self.home)
         self.env = dict(os.environ, HOME=self.home, PATH=f"{bin_}:{self.sysbin}", ZELLIJ_CONFIG_DIR=self.zc,
-                        CLAUDE_CONFIG_DIR=self.claude, CODEX_HOME=self.codex)
+                        CLAUDE_CONFIG_DIR=self.claude, CODEX_HOME=self.codex,
+                        XDG_CACHE_HOME=os.path.join(self.home, ".cache"))
         patcher = mock.patch.dict(os.environ, self.env, clear=True)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -434,6 +436,82 @@ class SetupTest(unittest.TestCase):
     def test_agy(self):
         self.agent_roundtrip("install-agy.sh", "agy",
                              {f"{self.home}/.gemini/antigravity-cli/settings.json": {"theme": "dark"}})
+
+    def test_uninstall_all(self):
+        settings = {
+            f"{self.claude}/settings.json": {"statusLine": {"command": "echo 'original'"}},
+            f"{self.codex}/hooks.json": {"hooks": {"Stop": []}},
+            f"{self.home}/.cursor/hooks.json": {"version": 1, "hooks": {}},
+            f"{self.home}/.cursor/cli-config.json": {"editor": {"vimMode": True}},
+            f"{self.home}/.gemini/antigravity-cli/settings.json": {"theme": "dark"},
+        }
+        for path, original in settings.items():
+            self.write_json(path, original)
+        os.makedirs(self.zc)
+        config = Path(self.home, "dotfiles.kdl")
+        original_config = 'default_layout "compact"\nkeybinds {\n}\n'
+        config.write_text(original_config)
+        config_link = Path(self.zc, "config.kdl")
+        config_link.symlink_to(config)
+        self.sh("./scripts/install.sh")
+        config.write_text(config.read_text().replace('default_layout "compact"',
+                          '// zellij-agents replaced: default_layout "compact"\n'
+                          'default_layout "agents" // zellij-agents'))
+        for script in ("hooks", "codex", "cursor", "agy"):
+            self.sh(f"./scripts/install-{script}.sh")
+
+        cache = Path(self.home, "custom cache")
+        self.env["XDG_CACHE_HOME"] = str(cache)
+        manager_cache = cache / "zellij-agents"
+        manager_cache.mkdir(parents=True)
+        (manager_cache / "state.json").touch()
+        permissions = cache / "zellij" / "permissions.kdl"
+        permissions.parent.mkdir()
+        unrelated = '"/other/plugin.wasm" {\n    RunCommands\n}\n'
+        permissions.write_text('"/old checkout/dist/zellij-agents.wasm" {\n    RunCommands\n}\n' + unrelated)
+
+        self.sh("./uninstall.sh")
+        self.assertTrue(config_link.is_symlink())
+        self.assertEqual(config.read_text(), original_config)
+        self.assertEqual(list(Path(self.zc, "layouts").iterdir()), [])
+        for path, original in settings.items():
+            self.assertEqual(json.loads(Path(path).read_text()), original)
+        self.assertEqual(list(Path(self.home).rglob("*.zam.bak")), [])
+        self.assertFalse(manager_cache.exists())
+        self.assertEqual(permissions.read_text(), unrelated)
+        before = self.mtimes()
+        self.sh("./uninstall.sh")
+        self.assertEqual(self.mtimes(), before)
+
+    def test_uninstall_without_zellij_config(self):
+        settings = Path(self.claude, "settings.json")
+        settings.parent.mkdir()
+        settings.write_text('{"model":"opus"}\n')
+        before = self.mtimes()
+        self.sh("./uninstall.sh")
+        self.assertFalse(Path(self.zc).exists())
+        self.assertEqual(self.mtimes(), before)
+
+    def test_uninstall_failure_keeps_backups_for_retry(self):
+        claude = Path(self.claude, "settings.json")
+        claude.parent.mkdir()
+        claude.write_text("invalid JSON")
+        agy = Path(self.home, ".gemini", "antigravity-cli", "settings.json")
+        original = {"theme": "dark"}
+        self.write_json(agy, original)
+        self.sh("./scripts/install-agy.sh")
+
+        result = subprocess.run(["./uninstall.sh"], env=self.env, cwd=ROOT, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Uninstall failed in scripts/install-hooks.sh", result.stderr)
+        self.assertEqual(json.loads(agy.read_text()), original)
+        backup = agy.with_suffix(".json.zam.bak")
+        self.assertTrue(backup.exists())
+        self.assertEqual(list(claude.parent.iterdir()), [claude])
+
+        self.write_json(claude, {})
+        self.sh("./uninstall.sh")
+        self.assertFalse(backup.exists())
 
     # ---- read-only status, and the curses menu driven through a pty ----
 

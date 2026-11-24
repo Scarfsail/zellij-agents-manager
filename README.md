@@ -60,7 +60,9 @@ Keys are shown with the `Ctrl+Alt` modifier. `./setup.sh` suggests the one your 
 
 ## Uninstall
 
-Run `./setup.sh` and choose Remove on the layouts and on each agent, or by hand: `scripts/install.sh --uninstall` and each agent script's `--uninstall` (see [Development](#development)).
+Run `./uninstall.sh` from the checkout to remove the Zellij layouts and keybindings, all agent hooks and status line wrappers, the manager's cache and `.zam.bak` backups, and the Zellij permissions saved for the plugin. Restart running agents and start a fresh Zellij session. You can then delete the checkout if you no longer need it.
+
+To remove individual integrations, use **Remove** in `./setup.sh` or the relevant script's `--uninstall` option (see [Development](#development)).
 
 ---
 
